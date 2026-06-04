@@ -1,0 +1,8 @@
+venv/
+helmet_dataset/
+runs/
+*.zip
+*.mp4
+*.pt
+__pycache__/
+*.pyc

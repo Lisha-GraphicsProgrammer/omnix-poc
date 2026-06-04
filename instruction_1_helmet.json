@@ -1,0 +1,36 @@
+{
+  "alert": {
+    "description": "Alert when a worker without a helmet enters the loading zone",
+    "trigger": {
+      "zone": "loading_zone",
+      "condition": {
+        "detect": "person",
+        "missing": "helmet",
+        "proximity": "within_zone"
+      }
+    },
+    "detection": {
+      "required_classes": ["person", "helmet"],
+      "logic": {
+        "type": "absence_in_association",
+        "rule": "person_detected AND NOT helmet_near_person"
+      },
+      "association": {
+        "method": "bounding_box_overlap_or_proximity",
+        "iou_threshold": 0.1,
+        "proximity_px": 50
+      }
+    },
+    "zone_definition": {
+      "name": "loading_zone",
+      "type": "polygon",
+      "coordinates": "user_defined"
+    },
+    "alert_action": {
+      "type": "alert",
+      "severity": "high",
+      "message": "Worker without helmet detected in loading zone",
+      "cooldown_seconds": 5
+    }
+  }
+}

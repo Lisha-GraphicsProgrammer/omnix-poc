@@ -1,0 +1,49 @@
+{
+  "alert": {
+    "description": "Alert when more than 5 people are simultaneously present in the restricted area",
+    "trigger": {
+      "zone": "restricted_area",
+      "condition": {
+        "detect": "person",
+        "aggregation": "count",
+        "operator": "greater_than",
+        "threshold": 5,
+        "evaluation": "simultaneous"
+      }
+    },
+    "detection": {
+      "required_classes": ["person"],
+      "logic": {
+        "type": "count_in_zone",
+        "rule": "COUNT(person_within_zone) > 5"
+      },
+      "counting": {
+        "method": "unique_tracked_ids_in_zone",
+        "deduplicate": true,
+        "min_confidence": 0.5,
+        "min_frames_visible": 3
+      }
+    },
+    "zone_definition": {
+      "name": "restricted_area",
+      "type": "polygon",
+      "coordinates": "user_defined"
+    },
+    "tracking": {
+      "enabled": true,
+      "algorithm": "bytetrack",
+      "persist_ids": true
+    },
+    "evaluation": {
+      "mode": "per_frame",
+      "count_reset": "when_below_threshold"
+    },
+    "alert_action": {
+      "type": "alert",
+      "severity": "high",
+      "message": "More than 5 people detected simultaneously in restricted area",
+      "cooldown_seconds": 10,
+      "include_count_in_message": true
+    }
+  }
+}

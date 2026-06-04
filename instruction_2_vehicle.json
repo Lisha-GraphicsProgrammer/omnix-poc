@@ -1,0 +1,40 @@
+{
+  "alert": {
+    "description": "Alert when a truck enters the warehouse gate area",
+    "trigger": {
+      "zone": "warehouse_gate_area",
+      "condition": {
+        "detect": "truck",
+        "event": "zone_entry"
+      }
+    },
+    "detection": {
+      "required_classes": ["truck"],
+      "logic": {
+        "type": "presence_in_zone",
+        "rule": "truck_detected AND within_zone"
+      },
+      "entry_detection": {
+        "method": "centroid_crossing",
+        "track_direction": true,
+        "min_frames_in_zone": 2
+      }
+    },
+    "zone_definition": {
+      "name": "warehouse_gate_area",
+      "type": "polygon",
+      "coordinates": "user_defined"
+    },
+    "tracking": {
+      "enabled": true,
+      "algorithm": "bytetrack",
+      "min_confidence": 0.5
+    },
+    "alert_action": {
+      "type": "alert",
+      "severity": "medium",
+      "message": "Truck detected entering warehouse gate area",
+      "cooldown_seconds": 10
+    }
+  }
+}
