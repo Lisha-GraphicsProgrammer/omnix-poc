@@ -1,8 +1,11 @@
 venv/
 helmet_dataset/
+vest_dataset/
 runs/
 *.zip
 *.mp4
 *.pt
 __pycache__/
 *.pyc
+incidents/
+incidents.json
