@@ -46,3 +46,33 @@
 
 \- PoC confirms core loop is viable — proceed to SRS phase
 
+## END OF WEEKEND - END-TO-END WORKING
+
+Real OMNIX V1 demo loop complete:
+
+1. Python pipeline (run_pipeline.py)
+   - Loads helmet + vest + base YOLO from JSON config
+   - Detects person + tracks via ByteTrack
+   - Zone-based violation rule
+   - Cooldown dedup (150 frames)
+   - Output: incidents.json + screenshots/
+
+2. FastAPI backend (api_server.py)
+   - GET /api/incidents - serves violations
+   - GET /api/stats - aggregate counts
+   - GET /api/pipeline - pipeline config
+   - /screenshots/* - static screenshot serving
+   - CORS enabled for frontend
+
+3. React frontend (omnix-UI)
+   - Login → Dashboard → Alert Detail flow
+   - Fetches real incidents from API
+   - Displays actual violation screenshots
+   - Auto-refresh every 5 seconds
+   - Built with MUI + Vite
+
+Verified end-to-end: pipeline runs → incidents written → API serves → 
+React displays with real screenshots → click row → see actual evidence frame.
+
+This is the demo we show advisors and pilot customers.
+

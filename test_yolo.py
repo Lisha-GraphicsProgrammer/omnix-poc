@@ -7,8 +7,12 @@ results = model(
     classes=[0, 2, 3, 7],
     conf=0.5,
     save=True,
-    show=True
+    show=True,
+    stream=True
 )
+
+for r in results:
+    pass
 
 print("Detection complete!")
 print("Output saved in runs/detect/predict/")
