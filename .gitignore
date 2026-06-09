@@ -9,3 +9,5 @@ __pycache__/
 *.pyc
 incidents/
 incidents.json
+.env
+pipeline_config.backup.json
