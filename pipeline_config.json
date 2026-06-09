@@ -1,27 +1,45 @@
 {
-  "pipeline_id": "vest_loading_zone",
-  "description": "Alert when worker without vest enters loading zone",
+  "pipeline_id": "auto_helmet_loading",
+  "description": "Worker without helmet in loading zone",
   "models": {
-    "helmet": "C:/dev/omnix-poc/runs/detect/helmet_model/weights/best.pt",
-    "vest": "C:/dev/omnix-poc/runs/detect/vest_model/weights/best.pt"
+    "helmet": "runs/detect/helmet_model/weights/best.pt"
   },
   "zones": [
     {
       "name": "loading_zone",
-      "coords": [[100, 200], [500, 200], [500, 600], [100, 600]]
+      "coords": [
+        [
+          100,
+          200
+        ],
+        [
+          500,
+          200
+        ],
+        [
+          500,
+          600
+        ],
+        [
+          100,
+          600
+        ]
+      ]
     }
   ],
   "rules": [
     {
       "type": "missing_in_zone",
       "zone": "loading_zone",
-      "required": ["vest"],
+      "required": [
+        "helmet"
+      ],
       "primary": "person"
     }
   ],
   "alert": {
     "severity": "high",
-    "message": "No vest in loading zone"
+    "message": "Helmet required in loading zone"
   },
   "cooldown_seconds": 30
 }
