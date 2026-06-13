@@ -11,14 +11,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = FastAPI(title="OMNIX POC API")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # Ensure incidents folder exists (prevents crash on fresh checkout)
 os.makedirs("incidents", exist_ok=True)
 
@@ -223,3 +221,164 @@ async def apply_rule(request: Request):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+# ============================================================
+# NEW ENDPOINTS - Video Streaming
+# ============================================================
+from fastapi.responses import StreamingResponse
+import cv2
+import threading
+import time
+
+# ─── Shared video state ───────────────────────────────────────────────────────
+class VideoStream:
+    def __init__(self):
+        self.cap = None
+        self.lock = threading.Lock()
+        self.running = False
+        self.current_frame = None
+        self.fps = 0
+        self.width = 0
+        self.height = 0
+        self.source = None
+
+    def start(self, source: str):
+        with self.lock:
+            if self.cap:
+                self.cap.release()
+            self.cap = cv2.VideoCapture(source)
+            if not self.cap.isOpened():
+                return False
+            self.source = source
+            self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 25
+            self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.running = True
+        return True
+
+    def read(self):
+        with self.lock:
+            if not self.cap or not self.running:
+                return None
+            ret, frame = self.cap.read()
+            if not ret:
+                # Loop video
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = self.cap.read()
+            if ret:
+                self.current_frame = frame
+                return frame
+            return None
+
+    def stop(self):
+        with self.lock:
+            self.running = False
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+
+video_stream = VideoStream()
+
+# Auto-start with construction.mp4 if it exists
+VIDEO_SOURCE = 0
+if isinstance(VIDEO_SOURCE, int) or Path(VIDEO_SOURCE).exists():
+    video_stream.start(VIDEO_SOURCE)
+
+
+def generate_frames(cam_id: int = 1):
+    """Generate MJPEG frames for streaming."""
+    target_fps = 25
+    frame_interval = 1.0 / target_fps
+
+    while True:
+        start = time.time()
+
+        frame = video_stream.read()
+        if frame is None:
+            # Send a black placeholder frame
+            placeholder = __import__('numpy').zeros((480, 640, 3), dtype=__import__('numpy').uint8)
+            cv2.putText(placeholder, "NO SIGNAL", (220, 240),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.5, (80, 80, 80), 2)
+            frame = placeholder
+
+        # Resize for bandwidth
+        frame = cv2.resize(frame, (854, 480))
+
+        # Encode as JPEG
+        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        if not ret:
+            continue
+
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' +
+               buffer.tobytes() + b'\r\n')
+
+        # Rate limiting
+        elapsed = time.time() - start
+        sleep_time = frame_interval - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+
+@app.get("/api/video/stream")
+def video_stream_endpoint():
+    """MJPEG stream — embed directly as <img src='...'> in browser."""
+    return StreamingResponse(
+        generate_frames(1),
+        media_type="multipart/x-mixed-replace;boundary=frame"
+    )
+
+@app.get("/api/video/snapshot")
+def video_snapshot():
+    """Return a single JPEG frame as a snapshot."""
+    frame = video_stream.read()
+    if frame is None:
+        raise HTTPException(status_code=503, detail="No video source available")
+    frame = cv2.resize(frame, (854, 480))
+    ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not ret:
+        raise HTTPException(status_code=500, detail="Failed to encode frame")
+    from fastapi.responses import Response
+    return Response(content=buffer.tobytes(), media_type="image/jpeg")
+
+
+@app.get("/api/cameras")
+def get_cameras():
+    """Return camera list with live status."""
+    video_ok = video_stream.running and video_stream.cap is not None
+
+    cameras = [
+        {
+            "id": 1,
+            "name": "Camera 1 — Loading Zone",
+            "location": "Loading zone entrance",
+            "status": "online" if video_ok else "offline",
+            "stream_url": "http://localhost:8000/api/video/stream" if video_ok else None,
+            "snapshot_url": "http://localhost:8000/api/video/snapshot" if video_ok else None,
+            "fps": int(video_stream.fps) if video_ok else 0,
+            "resolution": f"{video_stream.width}x{video_stream.height}" if video_ok else "N/A",
+            "source": video_stream.source or "none",
+        },
+        {"id": 2, "name": "Camera 2 — Crane Zone",    "location": "Crane operation area",  "status": "offline", "stream_url": None, "snapshot_url": None, "fps": 0, "resolution": "N/A", "source": "none"},
+        {"id": 3, "name": "Camera 3 — Storage",       "location": "Material storage",       "status": "offline", "stream_url": None, "snapshot_url": None, "fps": 0, "resolution": "N/A", "source": "none"},
+        {"id": 4, "name": "Camera 4 — Exit Gate",     "location": "South exit",             "status": "offline", "stream_url": None, "snapshot_url": None, "fps": 0, "resolution": "N/A", "source": "none"},
+        {"id": 5, "name": "Camera 5 — Scaffold A",    "location": "Scaffold zone A",        "status": "offline", "stream_url": None, "snapshot_url": None, "fps": 0, "resolution": "N/A", "source": "none"},
+        {"id": 6, "name": "Camera 6 — Scaffold B",    "location": "Scaffold zone B",        "status": "offline", "stream_url": None, "snapshot_url": None, "fps": 0, "resolution": "N/A", "source": "none"},
+        {"id": 7, "name": "Camera 7 — Warehouse",     "location": "Main warehouse",         "status": "offline", "stream_url": None, "snapshot_url": None, "fps": 0, "resolution": "N/A", "source": "none"},
+        {"id": 8, "name": "Camera 8 — Rooftop",       "location": "Rooftop overview",       "status": "offline", "stream_url": None, "snapshot_url": None, "fps": 0, "resolution": "N/A", "source": "none"},
+    ]
+    return cameras
+
+
+@app.post("/api/video/source")
+async def set_video_source(request: Request):
+    """Change video source (file path or RTSP URL)."""
+    body = await request.json()
+    source = body.get("source", "").strip()
+    if not source:
+        raise HTTPException(status_code=400, detail="source is required")
+    if not Path(source).exists() and not source.startswith("rtsp://"):
+        raise HTTPException(status_code=404, detail=f"File not found: {source}")
+    success = video_stream.start(source)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to open video source")
+    return {"status": "ok", "source": source, "fps": video_stream.fps}
