@@ -1,12 +1,55 @@
 {
-  "pipeline_id": "auto_helmet_loading",
-  "description": "Worker without helmet in loading zone",
+  "pipeline_id": "auto_forklift_worker__helmet_loading__count_restricted__count_restricted__count_restricted__count_restricted__helmet_loading",
+  "description": "Forklift detected near worker + Worker without helmet in loading zone + Count exceeded alert in restricted area + Count exceeded in restricted area + Count exceeded in restricted area + Count exceeded in restricted area + Worker without helmet in loading zone",
   "models": {
+    "person": "runs/detect/person_model/weights/best.pt",
     "helmet": "runs/detect/helmet_model/weights/best.pt"
   },
   "zones": [
     {
+      "name": "worker_zone",
+      "coords": [
+        [
+          100,
+          200
+        ],
+        [
+          500,
+          200
+        ],
+        [
+          500,
+          600
+        ],
+        [
+          100,
+          600
+        ]
+      ]
+    },
+    {
       "name": "loading_zone",
+      "coords": [
+        [
+          100,
+          200
+        ],
+        [
+          500,
+          200
+        ],
+        [
+          500,
+          600
+        ],
+        [
+          100,
+          600
+        ]
+      ]
+    },
+    {
+      "name": "restricted_area",
       "coords": [
         [
           100,
@@ -28,6 +71,60 @@
     }
   ],
   "rules": [
+    {
+      "type": "person_in_zone",
+      "zone": "worker_zone",
+      "required": [],
+      "primary": "person"
+    },
+    {
+      "type": "count_exceeded",
+      "zone": "worker_zone",
+      "required": [
+        "forklift"
+      ],
+      "N": 1
+    },
+    {
+      "type": "missing_in_zone",
+      "zone": "loading_zone",
+      "required": [
+        "helmet"
+      ],
+      "primary": "person"
+    },
+    {
+      "type": "count_exceeded",
+      "zone": "restricted_area",
+      "required": [
+        "person"
+      ],
+      "primary": "person"
+    },
+    {
+      "type": "count_exceeded",
+      "zone": "restricted_area",
+      "required": [
+        "person"
+      ],
+      "primary": "person"
+    },
+    {
+      "type": "count_exceeded",
+      "zone": "restricted_area",
+      "required": [
+        "person"
+      ],
+      "primary": "person"
+    },
+    {
+      "type": "count_exceeded",
+      "zone": "restricted_area",
+      "required": [
+        "person"
+      ],
+      "primary": "person"
+    },
     {
       "type": "missing_in_zone",
       "zone": "loading_zone",

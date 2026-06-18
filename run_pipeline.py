@@ -13,6 +13,8 @@ with open('pipeline_config.json', 'r') as f:
 print(f"\n{'='*60}")
 print(f"Pipeline: {config['pipeline_id']}")
 print(f"Description: {config['description']}")
+print(f"Zones: {len(config.get('zones', []))}")
+print(f"Rules: {len(config.get('rules', []))}")
 print(f"{'='*60}\n")
 
 # ============================================================
@@ -33,196 +35,235 @@ base_model = YOLO('yolov8n.pt')
 print(f"[OK] Loaded base YOLO for person detection\n")
 
 # ============================================================
-# HELPER: Check if person has required gear
+# HELPER: progressive incident writer
+# ============================================================
+INCIDENTS_FILE = Path('incidents.json')
+
+def append_incident(incident: dict):
+    if INCIDENTS_FILE.exists():
+        try:
+            with open(INCIDENTS_FILE, 'r') as f:
+                incidents = json.load(f)
+        except:
+            incidents = []
+    else:
+        incidents = []
+    incidents.append(incident)
+    tmp = INCIDENTS_FILE.with_suffix('.tmp')
+    with open(tmp, 'w') as f:
+        json.dump(incidents, f, indent=2)
+    tmp.replace(INCIDENTS_FILE)
+
+# ============================================================
+# HELPER: bbox overlap
 # ============================================================
 def bbox_overlap(box1, box2):
-    """Calculate IoU-like overlap between two bboxes (x1,y1,x2,y2)."""
     x1 = max(box1[0], box2[0])
     y1 = max(box1[1], box2[1])
     x2 = min(box1[2], box2[2])
     y2 = min(box1[3], box2[3])
-    
     if x2 < x1 or y2 < y1:
         return 0.0
-    
     intersection = (x2 - x1) * (y2 - y1)
     box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    
     if box2_area == 0:
         return 0.0
-    
-    # Return ratio of gear bbox inside person bbox
     return intersection / box2_area
 
-
 def check_required_gear(person_bbox, frame, required_gear, loaded_models):
-    """
-    Check if person has required gear (helmet, vest, etc).
-    Returns list of MISSING gear items.
-    """
     missing = []
-    
     for gear_name in required_gear:
         if gear_name not in loaded_models:
-            print(f"  [WARN] Required gear '{gear_name}' but model not loaded, skipping check")
+            print(f"  [WARN] Required gear '{gear_name}' but model not loaded, skipping")
             continue
-        
-        # Run gear detection on full frame
         gear_results = loaded_models[gear_name](frame, verbose=False, conf=0.4)
-        
-        # Check if any gear detection overlaps with this person
         has_gear = False
         if gear_results[0].boxes is not None and len(gear_results[0].boxes) > 0:
             for gear_box in gear_results[0].boxes.xyxy.cpu().numpy():
-                overlap = bbox_overlap(person_bbox, gear_box)
-                if overlap > 0.3:  # 30% of gear bbox inside person bbox
+                if bbox_overlap(person_bbox, gear_box) > 0.3:
                     has_gear = True
                     break
-        
         if not has_gear:
             missing.append(gear_name)
-    
     return missing
 
+# ============================================================
+# BUILD ZONE LOOKUP
+# ============================================================
+# Build a dict: zone_name -> {x_min, x_max, y_min, y_max}
+zones_map = {}
+for zone in config.get('zones', []):
+    coords = zone['coords']
+    zones_map[zone['name']] = {
+        'x_min': min(p[0] for p in coords),
+        'x_max': max(p[0] for p in coords),
+        'y_min': min(p[1] for p in coords),
+        'y_max': max(p[1] for p in coords),
+        'coords': coords,
+    }
+
+rules = config.get('rules', [])
+print(f"Active zones: {list(zones_map.keys())}")
+print(f"Active rules:")
+for r in rules:
+    print(f"  - {r['type']} in {r['zone']} (required: {r.get('required', [])})")
+print()
 
 # ============================================================
 # PIPELINE STATE
 # ============================================================
 Path('incidents').mkdir(exist_ok=True)
-incidents = []
+if INCIDENTS_FILE.exists():
+    INCIDENTS_FILE.unlink()
+
 incident_count = 0
+
+# Per-rule cooldown tracker: key = (rule_index, person_id)
 active_violations = {}
 
 video = 'test_video.mp4'
 print(f"Processing {video}...")
 
-# Get zone coords
-zone = config['zones'][0]['coords']
-zone_name = config['zones'][0]['name']
-zone_x_min = min(p[0] for p in zone)
-zone_x_max = max(p[0] for p in zone)
-zone_y_min = min(p[1] for p in zone)
-zone_y_max = max(p[1] for p in zone)
-
-# Get rule
-rule = config['rules'][0]
-rule_type = rule['type']
-required_gear = rule.get('required', [])
-
-print(f"Rule type: {rule_type}")
-print(f"Required gear: {required_gear if required_gear else 'none'}")
-print(f"Zone: {zone_name}\n")
+_cap = cv2.VideoCapture(video)
+ORIG_W = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+ORIG_H = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+_cap.release()
+print(f"[INFO] Original video resolution: {ORIG_W}x{ORIG_H}\n")
 
 # ============================================================
 # MAIN PROCESSING LOOP
 # ============================================================
 results = base_model.track(
-    source=video, 
-    persist=True, 
-    classes=[0],  # person only
-    stream=True, 
-    conf=0.5, 
+    source=video,
+    persist=True,
+    classes=[0],
+    stream=True,
+    conf=0.5,
     verbose=False
 )
 
 for frame_idx, result in enumerate(results):
     if result.boxes is None or result.boxes.id is None:
         continue
-    
+
     for box, track_id in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.id.cpu().numpy()):
         person_id = int(track_id)
         x1, y1, x2, y2 = box
         person_center_x = (x1 + x2) / 2
         person_bottom_y = y2
-        
-        # Check if person is in zone
-        in_zone = (
-            zone_x_min <= person_center_x <= zone_x_max and 
-            zone_y_min <= person_bottom_y <= zone_y_max
-        )
-        
-        if not in_zone:
-            # Check cooldown — person left zone
-            if person_id in active_violations:
-                last_seen = active_violations[person_id]
-                if frame_idx - last_seen > 150:
-                    del active_violations[person_id]
-            continue
-        
-        # ========================================
-        # PERSON IS IN ZONE — apply rule logic
-        # ========================================
-        violation_occurred = False
-        violation_type = "person_in_zone"
-        missing_gear = []
-        
-        if rule_type == "missing_in_zone" and required_gear:
-            # Check if person has required gear
-            missing_gear = check_required_gear(
-                (x1, y1, x2, y2),
-                result.orig_img,
-                required_gear,
-                models
+
+        # ── Check each rule independently ────────────────────────────────────
+        for rule_idx, rule in enumerate(rules):
+            zone_name = rule.get('zone', '')
+            if zone_name not in zones_map:
+                continue
+
+            zone = zones_map[zone_name]
+            rule_type    = rule.get('type', '')
+            required_gear = rule.get('required', [])
+
+            # Check if person is in this rule's zone
+            in_zone = (
+                zone['x_min'] <= person_center_x <= zone['x_max'] and
+                zone['y_min'] <= person_bottom_y <= zone['y_max']
             )
-            
-            if missing_gear:
+
+            cooldown_key = (rule_idx, person_id)
+
+            if not in_zone:
+                # Reset cooldown if person has been out long enough
+                if cooldown_key in active_violations:
+                    if frame_idx - active_violations[cooldown_key] > 150:
+                        del active_violations[cooldown_key]
+                continue
+
+            # ── Apply rule logic ──────────────────────────────────────────────
+            violation_occurred = False
+            violation_type     = rule_type
+            missing_gear       = []
+
+            if rule_type == "missing_in_zone" and required_gear:
+                missing_gear = check_required_gear(
+                    (x1, y1, x2, y2), result.orig_img, required_gear, models
+                )
+                if missing_gear:
+                    violation_occurred = True
+                    violation_type = f"missing_{'_'.join(missing_gear)}"
+
+            elif rule_type == "person_in_zone":
                 violation_occurred = True
-                violation_type = f"missing_{'_'.join(missing_gear)}"
-        
-        elif rule_type == "person_in_zone":
-            violation_occurred = True
-            violation_type = "person_in_zone"
-        
-        elif rule_type == "count_exceeded":
-            # Future: count persons in zone, fire if exceeds threshold
-            # For now, treat as person_in_zone
-            violation_occurred = True
-            violation_type = "person_in_zone"
-        
-        # ========================================
-        # FIRE ALERT (with cooldown dedup)
-        # ========================================
-        if violation_occurred and person_id not in active_violations:
-            incident_count += 1
-            incident_id = f"inc_{incident_count:04d}"
-            screenshot_path = f"incidents/{incident_id}.jpg"
-            
-            # Save screenshot with detection overlays
-            annotated = result.plot()
-            cv2.imwrite(screenshot_path, annotated)
-            
-            incident = {
-                "id": incident_id,
-                "timestamp": datetime.now().isoformat(),
-                "frame": frame_idx,
-                "camera": video,
-                "person_id": person_id,
-                "violation": violation_type,
-                "missing_gear": missing_gear,
-                "zone": zone_name,
-                "bbox": [float(x1), float(y1), float(x2), float(y2)],
-                "screenshot_path": screenshot_path,
-                "rule_type": rule_type,
-                "alert_message": config['alert']['message']
-            }
-            incidents.append(incident)
-            
-            if missing_gear:
-                print(f"Frame {frame_idx}: person #{person_id} missing {missing_gear} in {zone_name} → {incident_id}")
-            else:
-                print(f"Frame {frame_idx}: person #{person_id} in {zone_name} → {incident_id}")
-        
-        # Update cooldown timer
-        active_violations[person_id] = frame_idx
+
+            elif rule_type == "count_exceeded":
+                violation_occurred = True
+                violation_type = "person_in_zone"
+
+            # ── Fire alert with per-rule cooldown ─────────────────────────────
+            if violation_occurred and cooldown_key not in active_violations:
+                incident_count += 1
+                incident_id     = f"inc_{incident_count:04d}"
+                screenshot_path = f"incidents/{incident_id}.jpg"
+
+                # Draw on original frame
+                orig_frame = result.orig_img.copy()
+
+                if result.boxes is not None and len(result.boxes) > 0:
+                    for det_box, det_id in zip(
+                        result.boxes.xyxy.cpu().numpy(),
+                        result.boxes.id.cpu().numpy() if result.boxes.id is not None else [None] * len(result.boxes)
+                    ):
+                        bx1, by1, bx2, by2 = map(int, det_box)
+                        det_id_val = int(det_id) if det_id is not None else 0
+                        cv2.rectangle(orig_frame, (bx1, by1), (bx2, by2), (255, 100, 0), 2)
+                        label = f"id:{det_id_val} person"
+                        (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+                        cv2.rectangle(orig_frame, (bx1, by1 - lh - 8), (bx1 + lw + 4, by1), (255, 100, 0), -1)
+                        cv2.putText(orig_frame, label, (bx1 + 2, by1 - 4),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
+                # Draw ALL zones on the screenshot
+                for zn, zd in zones_map.items():
+                    color = (0, 255, 255) if zn == zone_name else (0, 180, 180)
+                    cv2.rectangle(orig_frame,
+                                  (int(zd['x_min']), int(zd['y_min'])),
+                                  (int(zd['x_max']), int(zd['y_max'])),
+                                  color, 2)
+                    cv2.putText(orig_frame, zn.replace("_", " ").upper(),
+                                (int(zd['x_min']) + 4, int(zd['y_min']) + 18),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+                cv2.imwrite(screenshot_path, orig_frame)
+
+                incident = {
+                    "id":            incident_id,
+                    "timestamp":     datetime.now().isoformat(),
+                    "frame":         frame_idx,
+                    "camera":        video,
+                    "person_id":     person_id,
+                    "violation":     violation_type,
+                    "missing_gear":  missing_gear,
+                    "zone":          zone_name,
+                    "rule_index":    rule_idx,
+                    "bbox":          [float(x1), float(y1), float(x2), float(y2)],
+                    "screenshot_path": screenshot_path,
+                    "rule_type":     rule_type,
+                    "alert_message": config['alert']['message']
+                }
+
+                append_incident(incident)
+
+                print(f"Frame {frame_idx}: person #{person_id} | rule[{rule_idx}] {rule_type} in {zone_name}"
+                      + (f" | missing: {missing_gear}" if missing_gear else "")
+                      + f" → {incident_id} [SAVED]")
+
+            # Update cooldown for this rule+person combo
+            active_violations[cooldown_key] = frame_idx
 
 # ============================================================
-# SAVE RESULTS
+# DONE
 # ============================================================
-with open('incidents.json', 'w') as f:
-    json.dump(incidents, f, indent=2)
-
+final_count = len(json.loads(INCIDENTS_FILE.read_text())) if INCIDENTS_FILE.exists() else 0
 print(f"\n{'='*60}")
-print(f"Done. {len(incidents)} unique incidents saved.")
+print(f"Done. {final_count} unique incidents saved.")
 print(f"  incidents.json")
-print(f"  incidents/ folder ({len(incidents)} screenshots)")
+print(f"  incidents/ folder ({final_count} screenshots)")
 print(f"{'='*60}\n")

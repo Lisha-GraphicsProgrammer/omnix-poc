@@ -9,6 +9,8 @@ import cv2
 import numpy as np
 import threading
 import time
+import subprocess
+import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -32,7 +34,6 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 
 
 def _parse_source(src):
-    """'0' → int 0 (webcam), 'test_video.mp4' → str (file), 'rtsp://...' → str."""
     if src is None:
         return "test_video.mp4"
     try:
@@ -41,20 +42,17 @@ def _parse_source(src):
         return str(src)
 
 
-# Video source: int (webcam id) | file path | rtsp:// URL
-# Set VIDEO_SOURCE in .env:
-#   VIDEO_SOURCE=0              → laptop webcam
-#   VIDEO_SOURCE=test_video.mp4 → local file
-#   VIDEO_SOURCE=rtsp://...     → IP camera
 VIDEO_SOURCE_DEFAULT = _parse_source(os.getenv("VIDEO_SOURCE", "test_video.mp4"))
 
-# In-memory settings (POC; persists per uvicorn run)
 _settings = {
     "detection": {"alert_cooldown_frames": 150, "detection_confidence": 0.5, "bytetrack_buffer": 30},
     "alerts": {"channels": "dashboard", "deduplication_enabled": True, "email_notifications_enabled": False},
     "ai_model": {"frame_sampling": "every", "model_precision": "balanced"},
     "platform": {"llm_model": "claude-haiku", "site_name": "Site A — Construction", "api_endpoint": "http://localhost:8000"},
 }
+
+# Track running pipeline subprocess
+_pipeline_process = None
 
 # ============================================================
 # CORE ENDPOINTS
@@ -160,7 +158,6 @@ Output ONLY the JSON. No markdown code fences, no explanation, no preamble."""
 
 @app.post("/api/rules/generate")
 async def generate_rule(request: Request):
-    """Convert English instruction to pipeline_config JSON via Ollama."""
     response_text = ""
     try:
         body = await request.json()
@@ -189,7 +186,6 @@ async def generate_rule(request: Request):
         result = response.json()
         response_text = result.get("response", "").strip()
 
-        # Defensive: strip markdown code fences if Ollama ignored format:"json"
         if response_text.startswith("```"):
             response_text = response_text.split("```")[1]
             if response_text.startswith("json"):
@@ -213,33 +209,181 @@ async def generate_rule(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def merge_configs(existing: dict, new_cfg: dict) -> dict:
+    """
+    Merge a new rule config into the existing pipeline_config.json.
+    - zones:  append new zones (skip duplicates by name)
+    - rules:  append all new rules
+    - models: union of all required models
+    - alert:  keep highest severity
+    - pipeline_id: combined name
+    """
+    SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+    # ── Zones: merge by name (no duplicates) ──────────────────────────────────
+    existing_zone_names = {z["name"] for z in existing.get("zones", [])}
+    merged_zones = list(existing.get("zones", []))
+    for zone in new_cfg.get("zones", []):
+        if zone["name"] not in existing_zone_names:
+            merged_zones.append(zone)
+            existing_zone_names.add(zone["name"])
+
+    # ── Rules: always append (same zone can have multiple rules) ──────────────
+    merged_rules = list(existing.get("rules", [])) + list(new_cfg.get("rules", []))
+
+    # ── Models: union ─────────────────────────────────────────────────────────
+    merged_models = {**existing.get("models", {}), **new_cfg.get("models", {})}
+
+    # ── Alert: keep highest severity ──────────────────────────────────────────
+    existing_sev = existing.get("alert", {}).get("severity", "medium")
+    new_sev      = new_cfg.get("alert", {}).get("severity", "medium")
+    if SEVERITY_ORDER.get(new_sev, 1) >= SEVERITY_ORDER.get(existing_sev, 1):
+        merged_alert = new_cfg.get("alert", existing.get("alert", {}))
+    else:
+        merged_alert = existing.get("alert", {})
+
+    # ── Cooldown: use the shorter (more sensitive) of the two ────────────────
+    merged_cooldown = min(
+        existing.get("cooldown_seconds", 30),
+        new_cfg.get("cooldown_seconds", 30)
+    )
+
+    # ── Pipeline ID: combine both names ───────────────────────────────────────
+    existing_id = existing.get("pipeline_id", "auto_rule")
+    new_id      = new_cfg.get("pipeline_id", "auto_rule")
+    # Strip shared "auto_" prefix for cleaner combined name
+    def strip_auto(s): return s[5:] if s.startswith("auto_") else s
+    merged_id = f"auto_{strip_auto(existing_id)}__{strip_auto(new_id)}"
+
+    # ── Description: combine ─────────────────────────────────────────────────
+    existing_desc = existing.get("description", "")
+    new_desc      = new_cfg.get("description", "")
+    merged_desc   = f"{existing_desc} + {new_desc}" if existing_desc else new_desc
+
+    return {
+        "pipeline_id":      merged_id,
+        "description":      merged_desc,
+        "models":           merged_models,
+        "zones":            merged_zones,
+        "rules":            merged_rules,
+        "alert":            merged_alert,
+        "cooldown_seconds": merged_cooldown,
+    }
+
+
 @app.post("/api/rules/apply")
 async def apply_rule(request: Request):
-    """Overwrite pipeline_config.json with new rule."""
+    """Merge new rule into pipeline_config.json and auto-launch pipeline."""
+    global _pipeline_process
     try:
         body = await request.json()
-        config = body.get("config")
+        new_config = body.get("config")
+        force_overwrite = body.get("overwrite", False)  # optional: force replace
 
-        if not config:
+        if not new_config:
             raise HTTPException(status_code=400, detail="config is required")
 
-        existing = Path("pipeline_config.json")
-        if existing.exists():
+        config_path = Path("pipeline_config.json")
+
+        # ── Backup existing config ────────────────────────────────────────────
+        if config_path.exists():
             backup_path = Path("pipeline_config.backup.json")
-            with open(existing, "r") as src, open(backup_path, "w") as dst:
+            with open(config_path, "r") as src, open(backup_path, "w") as dst:
                 dst.write(src.read())
 
-        with open("pipeline_config.json", "w") as f:
-            json.dump(config, f, indent=2)
+        # ── Merge or overwrite ────────────────────────────────────────────────
+        if config_path.exists() and not force_overwrite:
+            with open(config_path, "r") as f:
+                existing_config = json.load(f)
+            merged = merge_configs(existing_config, new_config)
+            print(f"[OMNIX] Merged rule into existing config → {merged['pipeline_id']}")
+            print(f"[OMNIX] Total zones: {len(merged['zones'])}, Total rules: {len(merged['rules'])}")
+        else:
+            merged = new_config
+            print(f"[OMNIX] New pipeline config → {merged['pipeline_id']}")
+
+        # ── Write merged config ───────────────────────────────────────────────
+        with open(config_path, "w") as f:
+            json.dump(merged, f, indent=2)
+
+        # ── Kill any existing pipeline ────────────────────────────────────────
+        if _pipeline_process is not None and _pipeline_process.poll() is None:
+            _pipeline_process.terminate()
+            try:
+                _pipeline_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _pipeline_process.kill()
+            print("[OMNIX] Stopped previous pipeline process")
+
+        # ── Clear old incidents ───────────────────────────────────────────────
+        incidents_file = Path("incidents.json")
+        if incidents_file.exists():
+            incidents_file.unlink()
+        for f in Path("incidents").glob("*.jpg"):
+            try:
+                f.unlink()
+            except:
+                pass
+
+        # ── Launch pipeline ───────────────────────────────────────────────────
+        _pipeline_process = subprocess.Popen(
+            [sys.executable, "run_pipeline.py"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        print(f"[OMNIX] Pipeline started (PID {_pipeline_process.pid})")
 
         return {
             "status": "applied",
-            "message": "Rule applied. Restart pipeline to take effect.",
-            "config_path": "pipeline_config.json"
+            "message": f"Rule merged and pipeline started. {len(merged['rules'])} rule(s) now active.",
+            "config_path": str(config_path),
+            "pipeline_id": merged["pipeline_id"],
+            "total_zones": len(merged["zones"]),
+            "total_rules": len(merged["rules"]),
+            "pipeline_pid": _pipeline_process.pid,
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/rules/reset")
+def reset_rules():
+    """Clear pipeline_config.json so next apply starts fresh (no merge)."""
+    config_path = Path("pipeline_config.json")
+    if config_path.exists():
+        backup_path = Path("pipeline_config.backup.json")
+        config_path.rename(backup_path)
+    return {"status": "reset", "message": "Pipeline config cleared. Next rule will start fresh."}
+
+
+@app.get("/api/pipeline/status")
+def pipeline_status():
+    """Check if the pipeline subprocess is currently running."""
+    global _pipeline_process
+    if _pipeline_process is None:
+        return {"running": False, "pid": None, "status": "not_started"}
+    poll = _pipeline_process.poll()
+    if poll is None:
+        return {"running": True, "pid": _pipeline_process.pid, "status": "running"}
+    else:
+        return {"running": False, "pid": _pipeline_process.pid, "status": "finished", "exit_code": poll}
+
+
+@app.post("/api/pipeline/stop")
+def stop_pipeline():
+    """Stop the running pipeline subprocess."""
+    global _pipeline_process
+    if _pipeline_process is None or _pipeline_process.poll() is not None:
+        return {"status": "not_running"}
+    _pipeline_process.terminate()
+    try:
+        _pipeline_process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        _pipeline_process.kill()
+    return {"status": "stopped", "pid": _pipeline_process.pid}
 
 
 # ============================================================
@@ -279,7 +423,6 @@ class VideoStream:
                 return None
             ret, frame = self.cap.read()
             if not ret:
-                # Loop video (only for files; webcam read() loops naturally)
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ret, frame = self.cap.read()
             if ret:
@@ -297,7 +440,6 @@ class VideoStream:
 
 video_stream = VideoStream()
 
-# Auto-start: webcams (int) always try; file paths must exist; rtsp always tries.
 source_ok = (
     isinstance(VIDEO_SOURCE_DEFAULT, int)
     or (isinstance(VIDEO_SOURCE_DEFAULT, str) and VIDEO_SOURCE_DEFAULT.startswith("rtsp://"))
@@ -305,21 +447,15 @@ source_ok = (
 )
 if source_ok:
     started = video_stream.start(VIDEO_SOURCE_DEFAULT)
-    label = (
-        f"webcam #{VIDEO_SOURCE_DEFAULT}"
-        if isinstance(VIDEO_SOURCE_DEFAULT, int)
-        else VIDEO_SOURCE_DEFAULT
-    )
+    label = f"webcam #{VIDEO_SOURCE_DEFAULT}" if isinstance(VIDEO_SOURCE_DEFAULT, int) else VIDEO_SOURCE_DEFAULT
     print(f"[OMNIX] Video stream auto-started: {label} ({'OK' if started else 'FAILED'})")
     if not started and isinstance(VIDEO_SOURCE_DEFAULT, int):
         print(f"[OMNIX] Webcam {VIDEO_SOURCE_DEFAULT} couldn't be opened. Try VIDEO_SOURCE=1 in .env.")
 else:
     print(f"[OMNIX] Video source not found: {VIDEO_SOURCE_DEFAULT}. Camera 1 will be offline.")
-    print(f"[OMNIX] Set VIDEO_SOURCE=<path|int|rtsp_url> in .env or POST /api/video/source to enable.")
 
 
 def generate_frames():
-    """Generate MJPEG frames for streaming."""
     target_fps = 25
     frame_interval = 1.0 / target_fps
 
@@ -351,16 +487,11 @@ def generate_frames():
 
 @app.get("/api/video/stream")
 def video_stream_endpoint():
-    """MJPEG stream — embed as <img src='...'> in browser."""
-    return StreamingResponse(
-        generate_frames(),
-        media_type="multipart/x-mixed-replace;boundary=frame"
-    )
+    return StreamingResponse(generate_frames(), media_type="multipart/x-mixed-replace;boundary=frame")
 
 
 @app.get("/api/video/snapshot")
 def video_snapshot():
-    """Single JPEG frame snapshot."""
     frame = video_stream.read()
     if frame is None:
         placeholder = np.zeros((480, 854, 3), dtype=np.uint8)
@@ -377,7 +508,6 @@ def video_snapshot():
 
 @app.post("/api/video/source")
 async def set_video_source(request: Request):
-    """Change video source at runtime: file path, rtsp:// URL, or webcam id (int as string)."""
     body = await request.json()
     raw_source = body.get("source", "")
     if isinstance(raw_source, str):
@@ -402,7 +532,6 @@ async def set_video_source(request: Request):
 
 @app.get("/api/cameras")
 def get_cameras():
-    """Return camera list with live status."""
     video_ok = video_stream.running and video_stream.cap is not None
 
     return [
@@ -428,7 +557,7 @@ def get_cameras():
 
 
 # ============================================================
-# SETTINGS (in-memory store)
+# SETTINGS
 # ============================================================
 
 @app.get("/api/settings")
