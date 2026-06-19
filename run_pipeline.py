@@ -18,21 +18,77 @@ print(f"Rules: {len(config.get('rules', []))}")
 print(f"{'='*60}\n")
 
 # ============================================================
-# MODEL LOADING
+# MODEL REGISTRY — load registry and lazy-load only needed models
 # ============================================================
-models = {}
-for name, path in config['models'].items():
-    if Path(path).exists():
-        try:
-            models[name] = YOLO(path)
-            print(f"[OK] Loaded {name} model")
-        except Exception as e:
-            print(f"[FAIL] Could not load {name}: {e}")
-    else:
-        print(f"[SKIP] {name} (file not found at {path})")
+with open('model_registry.json', 'r') as f:
+    registry = json.load(f)
 
-base_model = YOLO('yolov8n.pt')
-print(f"[OK] Loaded base YOLO for person detection\n")
+print(f"[INFO] Model registry loaded: {list(registry.keys())}")
+
+def load_model_from_registry(model_name: str) -> YOLO | None:
+    """Load a model by name from the registry. Returns None if not available."""
+    if model_name not in registry:
+        print(f"  [WARN] '{model_name}' not in registry")
+        return None
+
+    entry = registry[model_name]
+    model_type = entry.get("type", "custom")
+
+    if model_type == "coco_default":
+        # Use base YOLOv8 model with specific class filtering
+        model_path = entry.get("model", "yolov8n.pt")
+        if not Path(model_path).exists():
+            print(f"  [SKIP] {model_name}: base model {model_path} not found")
+            return None
+        try:
+            m = YOLO(model_path)
+            print(f"  [OK] Loaded {model_name} (COCO class {entry.get('class_id')}) from {model_path}")
+            return m
+        except Exception as e:
+            print(f"  [FAIL] {model_name}: {e}")
+            return None
+
+    elif model_type == "custom":
+        weights = entry.get("weights", "")
+        if not Path(weights).exists():
+            print(f"  [SKIP] {model_name}: weights not found at {weights}")
+            return None
+        try:
+            m = YOLO(weights)
+            print(f"  [OK] Loaded {model_name} from {weights}")
+            return m
+        except Exception as e:
+            print(f"  [FAIL] {model_name}: {e}")
+            return None
+
+    return None
+
+# ── Determine which models are needed by current pipeline_config ──────────────
+needed_models = set()
+for rule in config.get('rules', []):
+    for gear in rule.get('required', []):
+        needed_models.add(gear)
+# Also load models explicitly listed in config
+for name in config.get('models', {}).keys():
+    needed_models.add(name)
+
+print(f"\n[INFO] Models needed by pipeline: {needed_models}")
+print(f"[INFO] Loading only required models (lazy loading)...")
+
+# ── Lazy-load only needed models ──────────────────────────────────────────────
+models = {}
+for model_name in needed_models:
+    m = load_model_from_registry(model_name)
+    if m is not None:
+        models[model_name] = m
+
+# ── Always load base person detection model ───────────────────────────────────
+base_entry = registry.get("person", {})
+base_model_path = base_entry.get("model", "yolov8n.pt")
+base_conf = base_entry.get("confidence", 0.5)
+base_model = YOLO(base_model_path)
+print(f"\n[OK] Loaded base YOLO for person detection (conf={base_conf})")
+print(f"[INFO] Total models loaded: {list(models.keys())}\n")
 
 # ============================================================
 # HELPER: progressive incident writer
@@ -74,9 +130,19 @@ def check_required_gear(person_bbox, frame, required_gear, loaded_models):
     missing = []
     for gear_name in required_gear:
         if gear_name not in loaded_models:
-            print(f"  [WARN] Required gear '{gear_name}' but model not loaded, skipping")
+            print(f"  [WARN] Required gear '{gear_name}' not loaded, skipping")
             continue
-        gear_results = loaded_models[gear_name](frame, verbose=False, conf=0.4)
+        entry = registry.get(gear_name, {})
+        conf = entry.get("confidence", 0.4)
+
+        # For COCO default models, filter by class_id
+        if entry.get("type") == "coco_default":
+            class_id = entry.get("class_id", 0)
+            gear_results = loaded_models[gear_name](frame, verbose=False,
+                                                     conf=conf, classes=[class_id])
+        else:
+            gear_results = loaded_models[gear_name](frame, verbose=False, conf=conf)
+
         has_gear = False
         if gear_results[0].boxes is not None and len(gear_results[0].boxes) > 0:
             for gear_box in gear_results[0].boxes.xyxy.cpu().numpy():
@@ -90,7 +156,6 @@ def check_required_gear(person_bbox, frame, required_gear, loaded_models):
 # ============================================================
 # BUILD ZONE LOOKUP
 # ============================================================
-# Build a dict: zone_name -> {x_min, x_max, y_min, y_max}
 zones_map = {}
 for zone in config.get('zones', []):
     coords = zone['coords']
@@ -117,8 +182,6 @@ if INCIDENTS_FILE.exists():
     INCIDENTS_FILE.unlink()
 
 incident_count = 0
-
-# Per-rule cooldown tracker: key = (rule_index, person_id)
 active_violations = {}
 
 video = 'test_video.mp4'
@@ -138,7 +201,7 @@ results = base_model.track(
     persist=True,
     classes=[0],
     stream=True,
-    conf=0.5,
+    conf=base_conf,
     verbose=False
 )
 
@@ -152,17 +215,15 @@ for frame_idx, result in enumerate(results):
         person_center_x = (x1 + x2) / 2
         person_bottom_y = y2
 
-        # ── Check each rule independently ────────────────────────────────────
         for rule_idx, rule in enumerate(rules):
             zone_name = rule.get('zone', '')
             if zone_name not in zones_map:
                 continue
 
             zone = zones_map[zone_name]
-            rule_type    = rule.get('type', '')
+            rule_type     = rule.get('type', '')
             required_gear = rule.get('required', [])
 
-            # Check if person is in this rule's zone
             in_zone = (
                 zone['x_min'] <= person_center_x <= zone['x_max'] and
                 zone['y_min'] <= person_bottom_y <= zone['y_max']
@@ -171,13 +232,11 @@ for frame_idx, result in enumerate(results):
             cooldown_key = (rule_idx, person_id)
 
             if not in_zone:
-                # Reset cooldown if person has been out long enough
                 if cooldown_key in active_violations:
                     if frame_idx - active_violations[cooldown_key] > 150:
                         del active_violations[cooldown_key]
                 continue
 
-            # ── Apply rule logic ──────────────────────────────────────────────
             violation_occurred = False
             violation_type     = rule_type
             missing_gear       = []
@@ -197,13 +256,11 @@ for frame_idx, result in enumerate(results):
                 violation_occurred = True
                 violation_type = "person_in_zone"
 
-            # ── Fire alert with per-rule cooldown ─────────────────────────────
             if violation_occurred and cooldown_key not in active_violations:
                 incident_count += 1
                 incident_id     = f"inc_{incident_count:04d}"
                 screenshot_path = f"incidents/{incident_id}.jpg"
 
-                # Draw on original frame
                 orig_frame = result.orig_img.copy()
 
                 if result.boxes is not None and len(result.boxes) > 0:
@@ -220,7 +277,6 @@ for frame_idx, result in enumerate(results):
                         cv2.putText(orig_frame, label, (bx1 + 2, by1 - 4),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
-                # Draw ALL zones on the screenshot
                 for zn, zd in zones_map.items():
                     color = (0, 255, 255) if zn == zone_name else (0, 180, 180)
                     cv2.rectangle(orig_frame,
@@ -234,19 +290,19 @@ for frame_idx, result in enumerate(results):
                 cv2.imwrite(screenshot_path, orig_frame)
 
                 incident = {
-                    "id":            incident_id,
-                    "timestamp":     datetime.now().isoformat(),
-                    "frame":         frame_idx,
-                    "camera":        video,
-                    "person_id":     person_id,
-                    "violation":     violation_type,
-                    "missing_gear":  missing_gear,
-                    "zone":          zone_name,
-                    "rule_index":    rule_idx,
-                    "bbox":          [float(x1), float(y1), float(x2), float(y2)],
+                    "id":              incident_id,
+                    "timestamp":       datetime.now().isoformat(),
+                    "frame":           frame_idx,
+                    "camera":          video,
+                    "person_id":       person_id,
+                    "violation":       violation_type,
+                    "missing_gear":    missing_gear,
+                    "zone":            zone_name,
+                    "rule_index":      rule_idx,
+                    "bbox":            [float(x1), float(y1), float(x2), float(y2)],
                     "screenshot_path": screenshot_path,
-                    "rule_type":     rule_type,
-                    "alert_message": config['alert']['message']
+                    "rule_type":       rule_type,
+                    "alert_message":   config['alert']['message']
                 }
 
                 append_incident(incident)
@@ -255,7 +311,6 @@ for frame_idx, result in enumerate(results):
                       + (f" | missing: {missing_gear}" if missing_gear else "")
                       + f" → {incident_id} [SAVED]")
 
-            # Update cooldown for this rule+person combo
             active_violations[cooldown_key] = frame_idx
 
 # ============================================================

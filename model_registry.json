@@ -1,0 +1,11 @@
+{
+  "person":   { "type": "coco_default", "class_id": 0, "model": "yolov8n.pt", "confidence": 0.5 },
+  "truck":    { "type": "coco_default", "class_id": 7, "model": "yolov8n.pt", "confidence": 0.6 },
+  "helmet":   { "type": "custom", "weights": "runs/detect/helmet_model/weights/best.pt", "confidence": 0.5 },
+  "vest":     { "type": "custom", "weights": "runs/detect/vest_model/weights/best.pt", "confidence": 0.5 },
+  "forklift": { "type": "custom", "weights": "runs/detect/forklift_model/weights/best.pt", "confidence": 0.6 },
+  "fire":     { "type": "custom", "weights": "runs/detect/fire_model/weights/best.pt", "confidence": 0.7 },
+  "smoke":    { "type": "custom", "weights": "runs/detect/smoke_model/weights/best.pt", "confidence": 0.7 },
+  "gloves":   { "type": "custom", "weights": "runs/detect/gloves_model/weights/best.pt", "confidence": 0.6 },
+  "ladder":   { "type": "custom", "weights": "runs/detect/ladder_model/weights/best.pt", "confidence": 0.6 }
+}

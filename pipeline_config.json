@@ -1,9 +1,9 @@
 {
-  "pipeline_id": "auto_forklift_worker__helmet_loading__count_restricted__count_restricted__count_restricted__count_restricted__helmet_loading",
-  "description": "Forklift detected near worker + Worker without helmet in loading zone + Count exceeded alert in restricted area + Count exceeded in restricted area + Count exceeded in restricted area + Count exceeded in restricted area + Worker without helmet in loading zone",
+  "pipeline_id": "auto_forklift_worker__fire_detection",
+  "description": "Forklift detected near worker + Fire detected on site",
   "models": {
-    "person": "runs/detect/person_model/weights/best.pt",
-    "helmet": "runs/detect/helmet_model/weights/best.pt"
+    "forklift": "runs/detect/forklift_model/weights/best.pt",
+    "fire": "runs/detect/fire_model/weights/best.pt"
   },
   "zones": [
     {
@@ -28,55 +28,28 @@
       ]
     },
     {
-      "name": "loading_zone",
+      "name": "site_zone",
       "coords": [
         [
-          100,
-          200
+          50,
+          50
         ],
         [
-          500,
-          200
+          800,
+          50
         ],
         [
-          500,
-          600
+          800,
+          700
         ],
         [
-          100,
-          600
-        ]
-      ]
-    },
-    {
-      "name": "restricted_area",
-      "coords": [
-        [
-          100,
-          200
-        ],
-        [
-          500,
-          200
-        ],
-        [
-          500,
-          600
-        ],
-        [
-          100,
-          600
+          50,
+          700
         ]
       ]
     }
   ],
   "rules": [
-    {
-      "type": "person_in_zone",
-      "zone": "worker_zone",
-      "required": [],
-      "primary": "person"
-    },
     {
       "type": "count_exceeded",
       "zone": "worker_zone",
@@ -86,57 +59,23 @@
       "N": 1
     },
     {
-      "type": "missing_in_zone",
-      "zone": "loading_zone",
-      "required": [
-        "helmet"
-      ],
+      "type": "person_in_zone",
+      "zone": "worker_zone",
+      "required": [],
       "primary": "person"
     },
     {
-      "type": "count_exceeded",
-      "zone": "restricted_area",
+      "type": "person_in_zone",
+      "zone": "site_zone",
       "required": [
-        "person"
-      ],
-      "primary": "person"
-    },
-    {
-      "type": "count_exceeded",
-      "zone": "restricted_area",
-      "required": [
-        "person"
-      ],
-      "primary": "person"
-    },
-    {
-      "type": "count_exceeded",
-      "zone": "restricted_area",
-      "required": [
-        "person"
-      ],
-      "primary": "person"
-    },
-    {
-      "type": "count_exceeded",
-      "zone": "restricted_area",
-      "required": [
-        "person"
-      ],
-      "primary": "person"
-    },
-    {
-      "type": "missing_in_zone",
-      "zone": "loading_zone",
-      "required": [
-        "helmet"
+        "fire"
       ],
       "primary": "person"
     }
   ],
   "alert": {
-    "severity": "high",
-    "message": "Helmet required in loading zone"
+    "severity": "critical",
+    "message": "Fire detected on site!"
   },
-  "cooldown_seconds": 30
+  "cooldown_seconds": 10
 }
