@@ -1,6 +1,6 @@
 {
-  "pipeline_id": "auto_forklift_worker__helmet_loading__count_restricted__count_restricted__count_restricted__count_restricted__helmet_loading",
-  "description": "Forklift detected near worker + Worker without helmet in loading zone + Count exceeded alert in restricted area + Count exceeded in restricted area + Count exceeded in restricted area + Count exceeded in restricted area + Worker without helmet in loading zone",
+  "pipeline_id": "auto_forklift_worker__helmet_loading__count_restricted__count_restricted__count_restricted__count_restricted__helmet_loading__person_forklift__person_warehouse",
+  "description": "Forklift detected near worker + Worker without helmet in loading zone + Count exceeded alert in restricted area + Count exceeded in restricted area + Count exceeded in restricted area + Count exceeded in restricted area + Worker without helmet in loading zone + Forklift proximity alert near workers + Worker count exceeding 10 in warehouse zone",
   "models": {
     "person": "runs/detect/person_model/weights/best.pt",
     "helmet": "runs/detect/helmet_model/weights/best.pt"
@@ -50,6 +50,48 @@
     },
     {
       "name": "restricted_area",
+      "coords": [
+        [
+          100,
+          200
+        ],
+        [
+          500,
+          200
+        ],
+        [
+          500,
+          600
+        ],
+        [
+          100,
+          600
+        ]
+      ]
+    },
+    {
+      "name": "forklift_zone",
+      "coords": [
+        [
+          100,
+          200
+        ],
+        [
+          500,
+          200
+        ],
+        [
+          500,
+          600
+        ],
+        [
+          100,
+          600
+        ]
+      ]
+    },
+    {
+      "name": "warehouse_zone",
       "coords": [
         [
           100,
@@ -132,11 +174,23 @@
         "helmet"
       ],
       "primary": "person"
+    },
+    {
+      "type": "count_exceeded",
+      "zone": "forklift_zone",
+      "required": [],
+      "primary": "person"
+    },
+    {
+      "type": "count_exceeded",
+      "zone": "warehouse_zone",
+      "required": [],
+      "primary": "person"
     }
   ],
   "alert": {
     "severity": "high",
-    "message": "Helmet required in loading zone"
+    "message": "Worker count exceeded in warehouse zone"
   },
   "cooldown_seconds": 30
 }
