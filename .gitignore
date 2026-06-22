@@ -1,13 +1,29 @@
-venv/
-helmet_dataset/
-vest_dataset/
-runs/
-*.zip
-*.mp4
-*.pt
+# Runtime-generated — different on every machine
+incidents.json
+incidents/
+pipeline_config.json
+pipeline_config.backup.json
+test_summary.json
+
+# Python
 __pycache__/
 *.pyc
-incidents/
-incidents.json
+.venv/
+venv/
+
+# Training artifacts (keep weights, exclude training runs)
+runs/detect/predict*/
+runs/detect/*/results.csv
+runs/detect/*/results.png
+runs/detect/*/train_batch*.jpg
+runs/detect/*/val_batch*.jpg
+runs/detect/*/labels/
+runs/detect/*/args.yaml
+runs/detect/*/events.out.tfevents*
+
+# Local environment
 .env
-pipeline_config.backup.json
+
+# OS
+.DS_Store
+Thumbs.db

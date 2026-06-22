@@ -24,11 +24,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Ensure incidents folder exists
 os.makedirs("incidents", exist_ok=True)
 app.mount("/screenshots", StaticFiles(directory="incidents"), name="screenshots")
 
-# ─── Config ────────────────────────────────────────────────────────────────
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 
@@ -51,7 +49,6 @@ _settings = {
     "platform": {"llm_model": "claude-haiku", "site_name": "Site A — Construction", "api_endpoint": "http://localhost:8000"},
 }
 
-# Track running pipeline subprocess
 _pipeline_process = None
 
 # ============================================================
@@ -104,14 +101,20 @@ def get_stats():
 SYSTEM_PROMPT = """You are OMNIX's rule generator. Convert plain English safety instructions into valid pipeline_config.json for a YOLOv8 + ByteTrack computer vision pipeline.
 
 AVAILABLE MODELS:
-- "helmet" - detects construction hardhats
-- "vest" - detects safety vests
-- "person" - base YOLO person detection
+- "person"   - detects people on site (base YOLOv8, COCO trained)
+- "truck"    - detects trucks and heavy vehicles (base YOLOv8, COCO trained)
+- "helmet"   - detects construction hardhats (custom trained)
+- "vest"     - detects safety vests / hi-viz jackets (custom trained)
+- "forklift" - detects forklifts in warehouse and construction sites (custom trained, mAP 84%)
+- "fire"     - detects fire and flames (custom trained, mAP 75%)
+- "smoke"    - detects smoke on site (custom trained, mAP 75%)
+- "gloves"   - detects safety gloves on workers (custom trained, mAP 78%)
+- "ladder"   - detects ladders on construction sites (custom trained)
 
 AVAILABLE RULE TYPES:
-- "person_in_zone" - alert when any person enters zone
+- "person_in_zone"  - alert when any person enters zone
 - "missing_in_zone" - alert when person without required gear enters
-- "count_exceeded" - alert when more than N people in zone
+- "count_exceeded"  - alert when more than N people in zone
 
 OUTPUT FORMAT (must match exactly):
 {
@@ -151,6 +154,18 @@ Output:
 User: Alert when worker without helmet enters loading zone
 Output:
 {"pipeline_id": "auto_helmet_loading", "description": "Worker without helmet in loading zone", "models": {"helmet": "runs/detect/helmet_model/weights/best.pt"}, "zones": [{"name": "loading_zone", "coords": [[100,200],[500,200],[500,600],[100,600]]}], "rules": [{"type": "missing_in_zone", "zone": "loading_zone", "required": ["helmet"], "primary": "person"}], "alert": {"severity": "high", "message": "Helmet required in loading zone"}, "cooldown_seconds": 30}
+
+User: Alert when forklift comes within 5 meters of a worker
+Output:
+{"pipeline_id": "auto_forklift_worker", "description": "Forklift detected near worker", "models": {"forklift": "runs/detect/forklift_model/weights/best.pt"}, "zones": [{"name": "worker_zone", "coords": [[100,200],[500,200],[500,600],[100,600]]}], "rules": [{"type": "person_in_zone", "zone": "worker_zone", "required": [], "primary": "person"}, {"type": "count_exceeded", "zone": "worker_zone", "required": ["forklift"], "N": 1}], "alert": {"severity": "high", "message": "Forklift near worker"}, "cooldown_seconds": 30}
+
+User: Alert if fire detected anywhere
+Output:
+{"pipeline_id": "auto_fire_detection", "description": "Fire detected on site", "models": {"fire": "runs/detect/fire_model/weights/best.pt"}, "zones": [{"name": "site_zone", "coords": [[50,50],[800,50],[800,700],[50,700]]}], "rules": [{"type": "person_in_zone", "zone": "site_zone", "required": ["fire"], "primary": "person"}], "alert": {"severity": "critical", "message": "Fire detected on site!"}, "cooldown_seconds": 10}
+
+User: Alert when worker without gloves enters warehouse
+Output:
+{"pipeline_id": "auto_gloves_warehouse", "description": "Worker without gloves in warehouse", "models": {"gloves": "runs/detect/gloves_model/weights/best.pt"}, "zones": [{"name": "warehouse_zone", "coords": [[100,200],[500,200],[500,600],[100,600]]}], "rules": [{"type": "missing_in_zone", "zone": "warehouse_zone", "required": ["gloves"], "primary": "person"}], "alert": {"severity": "high", "message": "Safety gloves required in warehouse"}, "cooldown_seconds": 30}
 
 Only include models in "models" that are actually needed by the rule.
 Output ONLY the JSON. No markdown code fences, no explanation, no preamble."""
@@ -210,17 +225,8 @@ async def generate_rule(request: Request):
 
 
 def merge_configs(existing: dict, new_cfg: dict) -> dict:
-    """
-    Merge a new rule config into the existing pipeline_config.json.
-    - zones:  append new zones (skip duplicates by name)
-    - rules:  append all new rules
-    - models: union of all required models
-    - alert:  keep highest severity
-    - pipeline_id: combined name
-    """
     SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
-    # ── Zones: merge by name (no duplicates) ──────────────────────────────────
     existing_zone_names = {z["name"] for z in existing.get("zones", [])}
     merged_zones = list(existing.get("zones", []))
     for zone in new_cfg.get("zones", []):
@@ -228,13 +234,9 @@ def merge_configs(existing: dict, new_cfg: dict) -> dict:
             merged_zones.append(zone)
             existing_zone_names.add(zone["name"])
 
-    # ── Rules: always append (same zone can have multiple rules) ──────────────
     merged_rules = list(existing.get("rules", [])) + list(new_cfg.get("rules", []))
-
-    # ── Models: union ─────────────────────────────────────────────────────────
     merged_models = {**existing.get("models", {}), **new_cfg.get("models", {})}
 
-    # ── Alert: keep highest severity ──────────────────────────────────────────
     existing_sev = existing.get("alert", {}).get("severity", "medium")
     new_sev      = new_cfg.get("alert", {}).get("severity", "medium")
     if SEVERITY_ORDER.get(new_sev, 1) >= SEVERITY_ORDER.get(existing_sev, 1):
@@ -242,20 +244,16 @@ def merge_configs(existing: dict, new_cfg: dict) -> dict:
     else:
         merged_alert = existing.get("alert", {})
 
-    # ── Cooldown: use the shorter (more sensitive) of the two ────────────────
     merged_cooldown = min(
         existing.get("cooldown_seconds", 30),
         new_cfg.get("cooldown_seconds", 30)
     )
 
-    # ── Pipeline ID: combine both names ───────────────────────────────────────
     existing_id = existing.get("pipeline_id", "auto_rule")
     new_id      = new_cfg.get("pipeline_id", "auto_rule")
-    # Strip shared "auto_" prefix for cleaner combined name
     def strip_auto(s): return s[5:] if s.startswith("auto_") else s
     merged_id = f"auto_{strip_auto(existing_id)}__{strip_auto(new_id)}"
 
-    # ── Description: combine ─────────────────────────────────────────────────
     existing_desc = existing.get("description", "")
     new_desc      = new_cfg.get("description", "")
     merged_desc   = f"{existing_desc} + {new_desc}" if existing_desc else new_desc
@@ -273,25 +271,22 @@ def merge_configs(existing: dict, new_cfg: dict) -> dict:
 
 @app.post("/api/rules/apply")
 async def apply_rule(request: Request):
-    """Merge new rule into pipeline_config.json and auto-launch pipeline."""
     global _pipeline_process
     try:
         body = await request.json()
         new_config = body.get("config")
-        force_overwrite = body.get("overwrite", False)  # optional: force replace
+        force_overwrite = body.get("overwrite", False)
 
         if not new_config:
             raise HTTPException(status_code=400, detail="config is required")
 
         config_path = Path("pipeline_config.json")
 
-        # ── Backup existing config ────────────────────────────────────────────
         if config_path.exists():
             backup_path = Path("pipeline_config.backup.json")
             with open(config_path, "r") as src, open(backup_path, "w") as dst:
                 dst.write(src.read())
 
-        # ── Merge or overwrite ────────────────────────────────────────────────
         if config_path.exists() and not force_overwrite:
             with open(config_path, "r") as f:
                 existing_config = json.load(f)
@@ -302,11 +297,9 @@ async def apply_rule(request: Request):
             merged = new_config
             print(f"[OMNIX] New pipeline config → {merged['pipeline_id']}")
 
-        # ── Write merged config ───────────────────────────────────────────────
         with open(config_path, "w") as f:
             json.dump(merged, f, indent=2)
 
-        # ── Kill any existing pipeline ────────────────────────────────────────
         if _pipeline_process is not None and _pipeline_process.poll() is None:
             _pipeline_process.terminate()
             try:
@@ -315,7 +308,6 @@ async def apply_rule(request: Request):
                 _pipeline_process.kill()
             print("[OMNIX] Stopped previous pipeline process")
 
-        # ── Clear old incidents ───────────────────────────────────────────────
         incidents_file = Path("incidents.json")
         if incidents_file.exists():
             incidents_file.unlink()
@@ -325,7 +317,6 @@ async def apply_rule(request: Request):
             except:
                 pass
 
-        # ── Launch pipeline ───────────────────────────────────────────────────
         _pipeline_process = subprocess.Popen(
             [sys.executable, "run_pipeline.py"],
             stdout=subprocess.PIPE,
@@ -351,17 +342,17 @@ async def apply_rule(request: Request):
 
 @app.post("/api/rules/reset")
 def reset_rules():
-    """Clear pipeline_config.json so next apply starts fresh (no merge)."""
     config_path = Path("pipeline_config.json")
+    backup_path = Path("pipeline_config.backup.json")
     if config_path.exists():
-        backup_path = Path("pipeline_config.backup.json")
+        if backup_path.exists():
+            backup_path.unlink()  # delete old backup first (Windows fix)
         config_path.rename(backup_path)
     return {"status": "reset", "message": "Pipeline config cleared. Next rule will start fresh."}
 
 
 @app.get("/api/pipeline/status")
 def pipeline_status():
-    """Check if the pipeline subprocess is currently running."""
     global _pipeline_process
     if _pipeline_process is None:
         return {"running": False, "pid": None, "status": "not_started"}
@@ -374,7 +365,6 @@ def pipeline_status():
 
 @app.post("/api/pipeline/stop")
 def stop_pipeline():
-    """Stop the running pipeline subprocess."""
     global _pipeline_process
     if _pipeline_process is None or _pipeline_process.poll() is not None:
         return {"status": "not_running"}
@@ -449,8 +439,6 @@ if source_ok:
     started = video_stream.start(VIDEO_SOURCE_DEFAULT)
     label = f"webcam #{VIDEO_SOURCE_DEFAULT}" if isinstance(VIDEO_SOURCE_DEFAULT, int) else VIDEO_SOURCE_DEFAULT
     print(f"[OMNIX] Video stream auto-started: {label} ({'OK' if started else 'FAILED'})")
-    if not started and isinstance(VIDEO_SOURCE_DEFAULT, int):
-        print(f"[OMNIX] Webcam {VIDEO_SOURCE_DEFAULT} couldn't be opened. Try VIDEO_SOURCE=1 in .env.")
 else:
     print(f"[OMNIX] Video source not found: {VIDEO_SOURCE_DEFAULT}. Camera 1 will be offline.")
 
@@ -461,7 +449,6 @@ def generate_frames():
 
     while True:
         start = time.time()
-
         frame = video_stream.read()
         if frame is None:
             placeholder = np.zeros((480, 854, 3), dtype=np.uint8)
