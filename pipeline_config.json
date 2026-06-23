@@ -1,5 +1,5 @@
 {
-  "pipeline_id": "auto_forklift_worker_fire_detection_worker_count",
+  "pipeline_id": "auto_forklift_worker__fire_detection__worker_count",
   "description": "Forklift detected near worker + Fire detected on site + Worker count exceeded in warehouse zone",
   "models": {
     "forklift": "runs/detect/forklift_model/weights/best.pt",
@@ -10,28 +10,64 @@
     {
       "name": "worker_zone",
       "coords": [
-        [100, 200],
-        [500, 200],
-        [500, 600],
-        [100, 600]
+        [
+          100,
+          200
+        ],
+        [
+          500,
+          200
+        ],
+        [
+          500,
+          600
+        ],
+        [
+          100,
+          600
+        ]
       ]
     },
     {
       "name": "site_zone",
       "coords": [
-        [50, 50],
-        [800, 50],
-        [800, 700],
-        [50, 700]
+        [
+          50,
+          50
+        ],
+        [
+          800,
+          50
+        ],
+        [
+          800,
+          700
+        ],
+        [
+          50,
+          700
+        ]
       ]
     },
     {
       "name": "warehouse_zone",
       "coords": [
-        [100, 200],
-        [500, 200],
-        [500, 600],
-        [100, 600]
+        [
+          100,
+          200
+        ],
+        [
+          500,
+          200
+        ],
+        [
+          500,
+          600
+        ],
+        [
+          100,
+          600
+        ]
       ]
     }
   ],
@@ -39,7 +75,9 @@
     {
       "type": "count_exceeded",
       "zone": "worker_zone",
-      "required": ["forklift"],
+      "required": [
+        "forklift"
+      ],
       "N": 1
     },
     {
@@ -51,13 +89,17 @@
     {
       "type": "person_in_zone",
       "zone": "site_zone",
-      "required": ["fire"],
+      "required": [
+        "fire"
+      ],
       "primary": "person"
     },
     {
       "type": "count_exceeded",
       "zone": "warehouse_zone",
-      "required": ["gloves"],
+      "required": [
+        "gloves"
+      ],
       "N": 10
     }
   ],
