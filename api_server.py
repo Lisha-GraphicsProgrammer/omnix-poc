@@ -1,7 +1,9 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse, Response
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
 import json
 import os
 import requests
@@ -13,6 +15,13 @@ import subprocess
 import sys
 from pathlib import Path
 from dotenv import load_dotenv
+
+from db.session import get_db
+from db.models import User, Rule, Incident, Camera as CameraModel, Site
+from auth.password import hash_password, verify_password
+from auth.jwt_handler import create_token
+from auth.dependencies import get_current_user
+from db.seed import seed
 
 load_dotenv()
 
@@ -51,6 +60,79 @@ _settings = {
 
 _pipeline_process = None
 
+
+# ============================================================
+# STARTUP — seed DB
+# ============================================================
+
+@app.on_event("startup")
+def on_startup():
+    seed()
+
+
+# ============================================================
+# AUTH ENDPOINTS
+# ============================================================
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    name: str = ""
+
+
+@app.post("/api/auth/login")
+def login(body: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == body.email).first()
+    if not user or not verify_password(body.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    token = create_token(user.id)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {"id": user.id, "email": user.email, "name": user.name, "role": user.role}
+    }
+
+
+@app.post("/api/auth/register")
+def register(body: RegisterRequest, db: Session = Depends(get_db)):
+    existing = db.query(User).filter(User.email == body.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    site = db.query(Site).first()
+    user = User(
+        email=body.email,
+        password_hash=hash_password(body.password),
+        name=body.name,
+        role="admin",
+        site_id=site.id if site else None,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    token = create_token(user.id)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {"id": user.id, "email": user.email, "name": user.name, "role": user.role}
+    }
+
+
+@app.get("/api/auth/me")
+def me(current_user: User = Depends(get_current_user)):
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "name": current_user.name,
+        "role": current_user.role,
+        "site_id": current_user.site_id,
+    }
+
+
 # ============================================================
 # CORE ENDPOINTS
 # ============================================================
@@ -61,7 +143,36 @@ def root():
 
 
 @app.get("/api/incidents")
-def get_incidents():
+def get_incidents(db: Session = Depends(get_db)):
+    # Try DB first, fall back to incidents.json
+    try:
+        incidents = db.query(Incident).order_by(Incident.timestamp.desc()).limit(200).all()
+        if incidents:
+            result = []
+            for inc in incidents:
+                d = {
+                    "id": inc.id,
+                    "timestamp": inc.timestamp.isoformat() if inc.timestamp else None,
+                    "violation_type": inc.violation_type,
+                    "zone": inc.zone,
+                    "severity": inc.severity,
+                    "alert_message": inc.alert_message,
+                    "person_id": inc.person_track_id,
+                    "bbox": inc.bbox,
+                    "detected_objects": inc.detected_objects,
+                    "missing_gear": inc.missing_gear,
+                    "reviewed": inc.reviewed,
+                    "review_status": inc.review_status,
+                }
+                if inc.screenshot_path:
+                    filename = inc.screenshot_path.replace("incidents/", "")
+                    d["screenshot_url"] = f"http://localhost:8000/screenshots/{filename}"
+                result.append(d)
+            return result
+    except Exception:
+        pass
+
+    # fallback to JSON file
     incidents_file = Path("incidents.json")
     if not incidents_file.exists():
         return []
@@ -74,6 +185,26 @@ def get_incidents():
     return incidents
 
 
+@app.post("/api/incidents/{incident_id}/review")
+def review_incident(
+    incident_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    from datetime import datetime
+    body = {}
+    incident.reviewed = True
+    incident.review_status = body.get("status", "reviewed")
+    incident.reviewed_by = current_user.id
+    incident.reviewed_at = datetime.utcnow()
+    db.commit()
+    return {"status": "ok", "incident_id": incident_id}
+
+
 @app.get("/api/pipeline")
 def get_pipeline():
     with open("pipeline_config.json", "r") as f:
@@ -81,7 +212,16 @@ def get_pipeline():
 
 
 @app.get("/api/stats")
-def get_stats():
+def get_stats(db: Session = Depends(get_db)):
+    try:
+        incidents = db.query(Incident).all()
+        if incidents:
+            zones = list(set(i.zone for i in incidents if i.zone))
+            persons = list(set(i.person_track_id for i in incidents if i.person_track_id))
+            return {"total": len(incidents), "unique_persons": len(persons), "zones_affected": zones}
+    except Exception:
+        pass
+
     incidents_file = Path("incidents.json")
     if not incidents_file.exists():
         return {"total": 0, "unique_persons": 0, "zones_affected": []}
@@ -92,6 +232,37 @@ def get_stats():
         "unique_persons": len(set(i["person_id"] for i in incidents)),
         "zones_affected": list(set(i["zone"] for i in incidents))
     }
+
+
+# ============================================================
+# RULES (DB-backed)
+# ============================================================
+
+@app.get("/api/rules")
+def get_rules(db: Session = Depends(get_db)):
+    rules = db.query(Rule).filter(Rule.status == "active").all()
+    return [
+        {
+            "id": r.id,
+            "instruction": r.instruction,
+            "config_json": r.config_json,
+            "pipeline_id": r.pipeline_id,
+            "status": r.status,
+            "severity": r.severity,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rules
+    ]
+
+
+@app.delete("/api/rules/{rule_id}")
+def delete_rule(rule_id: int, db: Session = Depends(get_db)):
+    rule = db.query(Rule).filter(Rule.id == rule_id).first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    rule.status = "deleted"
+    db.commit()
+    return {"status": "deleted", "rule_id": rule_id}
 
 
 # ============================================================
@@ -238,7 +409,7 @@ def merge_configs(existing: dict, new_cfg: dict) -> dict:
     merged_models = {**existing.get("models", {}), **new_cfg.get("models", {})}
 
     existing_sev = existing.get("alert", {}).get("severity", "medium")
-    new_sev      = new_cfg.get("alert", {}).get("severity", "medium")
+    new_sev = new_cfg.get("alert", {}).get("severity", "medium")
     if SEVERITY_ORDER.get(new_sev, 1) >= SEVERITY_ORDER.get(existing_sev, 1):
         merged_alert = new_cfg.get("alert", existing.get("alert", {}))
     else:
@@ -250,35 +421,55 @@ def merge_configs(existing: dict, new_cfg: dict) -> dict:
     )
 
     existing_id = existing.get("pipeline_id", "auto_rule")
-    new_id      = new_cfg.get("pipeline_id", "auto_rule")
+    new_id = new_cfg.get("pipeline_id", "auto_rule")
     def strip_auto(s): return s[5:] if s.startswith("auto_") else s
     merged_id = f"auto_{strip_auto(existing_id)}__{strip_auto(new_id)}"
 
     existing_desc = existing.get("description", "")
-    new_desc      = new_cfg.get("description", "")
-    merged_desc   = f"{existing_desc} + {new_desc}" if existing_desc else new_desc
+    new_desc = new_cfg.get("description", "")
+    merged_desc = f"{existing_desc} + {new_desc}" if existing_desc else new_desc
 
     return {
-        "pipeline_id":      merged_id,
-        "description":      merged_desc,
-        "models":           merged_models,
-        "zones":            merged_zones,
-        "rules":            merged_rules,
-        "alert":            merged_alert,
+        "pipeline_id": merged_id,
+        "description": merged_desc,
+        "models": merged_models,
+        "zones": merged_zones,
+        "rules": merged_rules,
+        "alert": merged_alert,
         "cooldown_seconds": merged_cooldown,
     }
 
 
 @app.post("/api/rules/apply")
-async def apply_rule(request: Request):
+async def apply_rule(request: Request, db: Session = Depends(get_db)):
     global _pipeline_process
     try:
         body = await request.json()
         new_config = body.get("config")
+        instruction = body.get("instruction", "")
         force_overwrite = body.get("overwrite", False)
 
         if not new_config:
             raise HTTPException(status_code=400, detail="config is required")
+
+        # Save rule to DB
+        try:
+            site = db.query(Site).first()
+            admin = db.query(User).first()
+            if site and admin:
+                rule = Rule(
+                    site_id=site.id,
+                    user_id=admin.id,
+                    instruction=instruction,
+                    config_json=new_config,
+                    pipeline_id=new_config.get("pipeline_id"),
+                    status="active",
+                    severity=new_config.get("alert", {}).get("severity", "medium"),
+                )
+                db.add(rule)
+                db.commit()
+        except Exception as e:
+            print(f"[OMNIX] Warning: could not save rule to DB: {e}")
 
         config_path = Path("pipeline_config.json")
 
@@ -346,7 +537,7 @@ def reset_rules():
     backup_path = Path("pipeline_config.backup.json")
     if config_path.exists():
         if backup_path.exists():
-            backup_path.unlink()  # delete old backup first (Windows fix)
+            backup_path.unlink()
         config_path.rename(backup_path)
     return {"status": "reset", "message": "Pipeline config cleared. Next rule will start fresh."}
 
@@ -518,7 +709,7 @@ async def set_video_source(request: Request):
 # ============================================================
 
 @app.get("/api/cameras")
-def get_cameras():
+def get_cameras(db: Session = Depends(get_db)):
     video_ok = video_stream.running and video_stream.cap is not None
 
     return [

@@ -1,0 +1,16 @@
+version: "3.9"
+services:
+  postgres:
+    image: postgres:16
+    container_name: omnix-postgres
+    environment:
+      POSTGRES_USER: omnix
+      POSTGRES_PASSWORD: omnix_dev_password
+      POSTGRES_DB: omnix
+    ports:
+      - "5432:5432"
+    volumes:
+      - omnix_pg_data:/var/lib/postgresql/data
+
+volumes:
+  omnix_pg_data:

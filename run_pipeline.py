@@ -4,6 +4,14 @@ from datetime import datetime
 from pathlib import Path
 from ultralytics import YOLO
 
+# DB imports
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+from db.session import SessionLocal
+from db.models import Incident, Rule, Site, Camera as CameraModel
+
 # ============================================================
 # CONFIG LOADING
 # ============================================================
@@ -16,6 +24,35 @@ print(f"Description: {config['description']}")
 print(f"Zones: {len(config.get('zones', []))}")
 print(f"Rules: {len(config.get('rules', []))}")
 print(f"{'='*60}\n")
+
+# ============================================================
+# LOAD DB REFERENCES
+# ============================================================
+def get_db_refs():
+    """Get site_id, camera_id, rule_id from DB for incident writing."""
+    try:
+        db = SessionLocal()
+        site = db.query(Site).first()
+        camera = db.query(CameraModel).first()
+        rule = db.query(Rule).filter(
+            Rule.pipeline_id == config['pipeline_id'],
+            Rule.status == 'active'
+        ).first()
+        # fallback: get any active rule
+        if not rule:
+            rule = db.query(Rule).filter(Rule.status == 'active').first()
+        db.close()
+        return (
+            site.id if site else None,
+            camera.id if camera else None,
+            rule.id if rule else None,
+        )
+    except Exception as e:
+        print(f"[WARN] Could not get DB refs: {e}")
+        return None, None, None
+
+site_id, camera_id, rule_id = get_db_refs()
+print(f"[DB] site_id={site_id}, camera_id={camera_id}, rule_id={rule_id}")
 
 # ============================================================
 # MODEL REGISTRY — load registry and lazy-load only needed models
@@ -35,7 +72,6 @@ def load_model_from_registry(model_name: str) -> YOLO | None:
     model_type = entry.get("type", "custom")
 
     if model_type == "coco_default":
-        # Use base YOLOv8 model with specific class filtering
         model_path = entry.get("model", "yolov8n.pt")
         if not Path(model_path).exists():
             print(f"  [SKIP] {model_name}: base model {model_path} not found")
@@ -63,26 +99,23 @@ def load_model_from_registry(model_name: str) -> YOLO | None:
 
     return None
 
-# ── Determine which models are needed by current pipeline_config ──────────────
+# Determine which models are needed
 needed_models = set()
 for rule in config.get('rules', []):
     for gear in rule.get('required', []):
         needed_models.add(gear)
-# Also load models explicitly listed in config
 for name in config.get('models', {}).keys():
     needed_models.add(name)
 
 print(f"\n[INFO] Models needed by pipeline: {needed_models}")
 print(f"[INFO] Loading only required models (lazy loading)...")
 
-# ── Lazy-load only needed models ──────────────────────────────────────────────
 models = {}
 for model_name in needed_models:
     m = load_model_from_registry(model_name)
     if m is not None:
         models[model_name] = m
 
-# ── Always load base person detection model ───────────────────────────────────
 base_entry = registry.get("person", {})
 base_model_path = base_entry.get("model", "yolov8n.pt")
 base_conf = base_entry.get("confidence", 0.5)
@@ -91,11 +124,46 @@ print(f"\n[OK] Loaded base YOLO for person detection (conf={base_conf})")
 print(f"[INFO] Total models loaded: {list(models.keys())}\n")
 
 # ============================================================
-# HELPER: progressive incident writer
+# HELPER: write incident to DB + JSON fallback
 # ============================================================
 INCIDENTS_FILE = Path('incidents.json')
 
 def append_incident(incident: dict):
+    """Write to DB first, fall back to JSON."""
+    # --- DB write ---
+    if rule_id and site_id:
+        try:
+            db = SessionLocal()
+            db_incident = Incident(
+                rule_id=rule_id,
+                camera_id=camera_id,
+                site_id=site_id,
+                timestamp=datetime.fromisoformat(incident["timestamp"]),
+                frame_number=incident.get("frame"),
+                person_track_id=incident.get("person_id"),
+                violation_type=incident.get("violation"),
+                detected_objects=None,
+                missing_gear=incident.get("missing_gear") or None,
+                zone=incident.get("zone"),
+                bbox=incident.get("bbox"),
+                screenshot_path=incident.get("screenshot_path"),
+                severity=config.get("alert", {}).get("severity", "medium"),
+                alert_message=incident.get("alert_message"),
+                reviewed=False,
+            )
+            db.add(db_incident)
+            db.commit()
+            db.close()
+            print(f"  [DB] Incident saved to PostgreSQL")
+        except Exception as e:
+            print(f"  [WARN] DB write failed: {e}, falling back to JSON")
+            _append_json(incident)
+    else:
+        _append_json(incident)
+
+
+def _append_json(incident: dict):
+    """JSON fallback writer."""
     if INCIDENTS_FILE.exists():
         try:
             with open(INCIDENTS_FILE, 'r') as f:
@@ -109,6 +177,7 @@ def append_incident(incident: dict):
     with open(tmp, 'w') as f:
         json.dump(incidents, f, indent=2)
     tmp.replace(INCIDENTS_FILE)
+
 
 # ============================================================
 # HELPER: bbox overlap
@@ -126,6 +195,7 @@ def bbox_overlap(box1, box2):
         return 0.0
     return intersection / box2_area
 
+
 def check_required_gear(person_bbox, frame, required_gear, loaded_models):
     missing = []
     for gear_name in required_gear:
@@ -135,7 +205,6 @@ def check_required_gear(person_bbox, frame, required_gear, loaded_models):
         entry = registry.get(gear_name, {})
         conf = entry.get("confidence", 0.4)
 
-        # For COCO default models, filter by class_id
         if entry.get("type") == "coco_default":
             class_id = entry.get("class_id", 0)
             gear_results = loaded_models[gear_name](frame, verbose=False,
@@ -152,6 +221,7 @@ def check_required_gear(person_bbox, frame, required_gear, loaded_models):
         if not has_gear:
             missing.append(gear_name)
     return missing
+
 
 # ============================================================
 # BUILD ZONE LOOKUP
@@ -316,9 +386,15 @@ for frame_idx, result in enumerate(results):
 # ============================================================
 # DONE
 # ============================================================
-final_count = len(json.loads(INCIDENTS_FILE.read_text())) if INCIDENTS_FILE.exists() else 0
-print(f"\n{'='*60}")
-print(f"Done. {final_count} unique incidents saved.")
-print(f"  incidents.json")
-print(f"  incidents/ folder ({final_count} screenshots)")
-print(f"{'='*60}\n")
+try:
+    db = SessionLocal()
+    final_count = db.query(Incident).filter(Incident.site_id == site_id).count()
+    db.close()
+    print(f"\n{'='*60}")
+    print(f"Done. {final_count} total incidents in PostgreSQL.")
+    print(f"{'='*60}\n")
+except Exception:
+    final_count = len(json.loads(INCIDENTS_FILE.read_text())) if INCIDENTS_FILE.exists() else 0
+    print(f"\n{'='*60}")
+    print(f"Done. {final_count} unique incidents saved to JSON fallback.")
+    print(f"{'='*60}\n")
