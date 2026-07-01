@@ -83,6 +83,7 @@ class RegisterRequest(BaseModel):
     email: str
     password: str
     name: str = ""
+    site_name: str = "My Site"
 
 
 @app.post("/api/auth/login")
@@ -103,13 +104,16 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
     existing = db.query(User).filter(User.email == body.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
-    site = db.query(Site).first()
+    # Create a new site for this user
+    site = Site(name=body.site_name, location="")
+    db.add(site)
+    db.flush()
     user = User(
         email=body.email,
         password_hash=hash_password(body.password),
         name=body.name,
         role="admin",
-        site_id=site.id if site else None,
+        site_id=site.id,
     )
     db.add(user)
     db.commit()
@@ -118,7 +122,7 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
     return {
         "access_token": token,
         "token_type": "bearer",
-        "user": {"id": user.id, "email": user.email, "name": user.name, "role": user.role}
+        "user": {"id": user.id, "email": user.email, "name": user.name, "role": user.role, "site_id": user.site_id}
     }
 
 
@@ -134,6 +138,62 @@ def me(current_user: User = Depends(get_current_user)):
 
 
 # ============================================================
+# USER MANAGEMENT (Task 2)
+# ============================================================
+
+@app.post("/api/users/invite")
+async def invite_user(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can invite users")
+    body = await request.json()
+    email = body.get("email", "").strip()
+    name = body.get("name", "").strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="email is required")
+    existing = db.query(User).filter(User.email == email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    viewer = User(
+        email=email,
+        password_hash=hash_password("changeme123"),
+        name=name or email.split("@")[0],
+        role="viewer",
+        site_id=current_user.site_id,
+    )
+    db.add(viewer)
+    db.commit()
+    db.refresh(viewer)
+    return {
+        "status": "invited",
+        "user": {"id": viewer.id, "email": viewer.email, "name": viewer.name, "role": viewer.role}
+    }
+
+
+@app.get("/api/users")
+def get_users(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can view team members")
+    users = db.query(User).filter(User.site_id == current_user.site_id).all()
+    return [
+        {
+            "id": u.id,
+            "email": u.email,
+            "name": u.name,
+            "role": u.role,
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+        }
+        for u in users
+    ]
+
+
+# ============================================================
 # CORE ENDPOINTS
 # ============================================================
 
@@ -143,17 +203,21 @@ def root():
 
 
 @app.get("/api/incidents")
-def get_incidents(db: Session = Depends(get_db)):
-    # Try DB first, fall back to incidents.json
+def get_incidents(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     try:
-        incidents = db.query(Incident).order_by(Incident.timestamp.desc()).limit(200).all()
+        incidents = db.query(Incident).filter(
+            Incident.site_id == current_user.site_id
+        ).order_by(Incident.timestamp.desc()).limit(200).all()
         if incidents:
             result = []
             for inc in incidents:
                 d = {
                     "id": inc.id,
                     "timestamp": inc.timestamp.isoformat() if inc.timestamp else None,
-                    "violation_type": inc.violation_type,
+                    "violation": inc.violation_type,
                     "zone": inc.zone,
                     "severity": inc.severity,
                     "alert_message": inc.alert_message,
@@ -196,9 +260,8 @@ def review_incident(
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
     from datetime import datetime
-    body = {}
     incident.reviewed = True
-    incident.review_status = body.get("status", "reviewed")
+    incident.review_status = "reviewed"
     incident.reviewed_by = current_user.id
     incident.reviewed_at = datetime.utcnow()
     db.commit()
@@ -212,9 +275,14 @@ def get_pipeline():
 
 
 @app.get("/api/stats")
-def get_stats(db: Session = Depends(get_db)):
+def get_stats(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     try:
-        incidents = db.query(Incident).all()
+        incidents = db.query(Incident).filter(
+            Incident.site_id == current_user.site_id
+        ).all()
         if incidents:
             zones = list(set(i.zone for i in incidents if i.zone))
             persons = list(set(i.person_track_id for i in incidents if i.person_track_id))
@@ -239,8 +307,14 @@ def get_stats(db: Session = Depends(get_db)):
 # ============================================================
 
 @app.get("/api/rules")
-def get_rules(db: Session = Depends(get_db)):
-    rules = db.query(Rule).filter(Rule.status == "active").all()
+def get_rules(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    rules = db.query(Rule).filter(
+        Rule.status == "active",
+        Rule.site_id == current_user.site_id
+    ).all()
     return [
         {
             "id": r.id,
@@ -256,8 +330,17 @@ def get_rules(db: Session = Depends(get_db)):
 
 
 @app.delete("/api/rules/{rule_id}")
-def delete_rule(rule_id: int, db: Session = Depends(get_db)):
-    rule = db.query(Rule).filter(Rule.id == rule_id).first()
+def delete_rule(
+    rule_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Viewers cannot delete rules")
+    rule = db.query(Rule).filter(
+        Rule.id == rule_id,
+        Rule.site_id == current_user.site_id
+    ).first()
     if not rule:
         raise HTTPException(status_code=404, detail="Rule not found")
     rule.status = "deleted"
@@ -441,7 +524,8 @@ def merge_configs(existing: dict, new_cfg: dict) -> dict:
 
 
 @app.post("/api/rules/apply")
-async def apply_rule(request: Request, db: Session = Depends(get_db)):
+async def apply_rule(request: Request, db: Session = Depends(get_db),
+                     current_user: User = Depends(get_current_user)):
     global _pipeline_process
     try:
         body = await request.json()
@@ -452,22 +536,22 @@ async def apply_rule(request: Request, db: Session = Depends(get_db)):
         if not new_config:
             raise HTTPException(status_code=400, detail="config is required")
 
-        # Save rule to DB
+        if current_user.role != "admin":
+            raise HTTPException(status_code=403, detail="Viewers cannot apply rules")
+
+        # Save rule to DB with current user's site
         try:
-            site = db.query(Site).first()
-            admin = db.query(User).first()
-            if site and admin:
-                rule = Rule(
-                    site_id=site.id,
-                    user_id=admin.id,
-                    instruction=instruction,
-                    config_json=new_config,
-                    pipeline_id=new_config.get("pipeline_id"),
-                    status="active",
-                    severity=new_config.get("alert", {}).get("severity", "medium"),
-                )
-                db.add(rule)
-                db.commit()
+            rule = Rule(
+                site_id=current_user.site_id,
+                user_id=current_user.id,
+                instruction=instruction,
+                config_json=new_config,
+                pipeline_id=new_config.get("pipeline_id"),
+                status="active",
+                severity=new_config.get("alert", {}).get("severity", "medium"),
+            )
+            db.add(rule)
+            db.commit()
         except Exception as e:
             print(f"[OMNIX] Warning: could not save rule to DB: {e}")
 
@@ -532,7 +616,12 @@ async def apply_rule(request: Request, db: Session = Depends(get_db)):
 
 
 @app.post("/api/rules/reset")
-def reset_rules():
+def reset_rules(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Viewers cannot reset rules")
     config_path = Path("pipeline_config.json")
     backup_path = Path("pipeline_config.backup.json")
     if config_path.exists():

@@ -1,10 +1,11 @@
 {
-  "pipeline_id": "auto_forklift_worker__fire_detection__worker_count",
-  "description": "Forklift detected near worker + Fire detected on site + Worker count exceeded in warehouse zone",
+  "pipeline_id": "auto_forklift_worker__fire_detection__worker_count__helmet_loading__worker_count__forklift_worker__helmet_loading",
+  "description": "Forklift detected near worker + Fire detected on site + Worker count exceeded in warehouse zone + Worker without helmet in loading zone + Worker count exceeded in warehouse zone + Forklift detected near worker + Worker without helmet in loading zone",
   "models": {
     "forklift": "runs/detect/forklift_model/weights/best.pt",
     "fire": "runs/detect/fire_model/weights/best.pt",
-    "gloves": "runs/detect/gloves_model/weights/best.pt"
+    "gloves": "runs/detect/gloves_model/weights/best.pt",
+    "helmet": "runs/detect/helmet_model/weights/best.pt"
   },
   "zones": [
     {
@@ -69,6 +70,27 @@
           600
         ]
       ]
+    },
+    {
+      "name": "loading_zone",
+      "coords": [
+        [
+          100,
+          200
+        ],
+        [
+          500,
+          200
+        ],
+        [
+          500,
+          600
+        ],
+        [
+          100,
+          600
+        ]
+      ]
     }
   ],
   "rules": [
@@ -101,6 +123,44 @@
         "gloves"
       ],
       "N": 10
+    },
+    {
+      "type": "missing_in_zone",
+      "zone": "loading_zone",
+      "required": [
+        "helmet"
+      ],
+      "primary": "person"
+    },
+    {
+      "type": "count_exceeded",
+      "zone": "warehouse_zone",
+      "required": [
+        "gloves"
+      ],
+      "N": 10
+    },
+    {
+      "type": "person_in_zone",
+      "zone": "worker_zone",
+      "required": [],
+      "primary": "person"
+    },
+    {
+      "type": "count_exceeded",
+      "zone": "worker_zone",
+      "required": [
+        "forklift"
+      ],
+      "N": 1
+    },
+    {
+      "type": "missing_in_zone",
+      "zone": "loading_zone",
+      "required": [
+        "helmet"
+      ],
+      "primary": "person"
     }
   ],
   "alert": {

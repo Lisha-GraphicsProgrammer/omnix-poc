@@ -1,0 +1,14 @@
+names:
+- driver
+- forklift
+- person
+nc: 3
+roboflow:
+  license: CC BY 4.0
+  project: forklift-gfijl
+  url: https://universe.roboflow.com/epp-internship-0rrmj/forklift-gfijl/dataset/2
+  version: 2
+  workspace: epp-internship-0rrmj
+test: ../test/images
+train: ../train/images
+val: ../valid/images
