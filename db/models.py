@@ -40,11 +40,25 @@ class Camera(Base):
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
 
+class Zone(Base):
+    __tablename__ = "zones"
+    id         = Column(Integer, primary_key=True)
+    site_id    = Column(Integer, ForeignKey("sites.id", ondelete="CASCADE"), nullable=False)
+    camera_id  = Column(Integer, ForeignKey("cameras.id", ondelete="SET NULL"), nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    name       = Column(Text, nullable=False)
+    polygon    = Column(JSONB, nullable=False)  # [[x,y], [x,y], ...]
+    color      = Column(Text, default="#00D4FF")
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+
+
 class Rule(Base):
     __tablename__ = "rules"
     id          = Column(Integer, primary_key=True)
     site_id     = Column(Integer, ForeignKey("sites.id", ondelete="CASCADE"), nullable=False)
     user_id     = Column(Integer, ForeignKey("users.id"), nullable=False)
+    zone_id     = Column(Integer, ForeignKey("zones.id", ondelete="SET NULL"), nullable=True)
     instruction = Column(Text, nullable=False)
     config_json = Column(JSONB, nullable=False)
     pipeline_id = Column(Text)
