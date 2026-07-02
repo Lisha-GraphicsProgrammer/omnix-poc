@@ -17,7 +17,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from db.session import get_db
-from db.models import User, Rule, Incident, Camera as CameraModel, Site
+from db.models import User, Rule, Incident, Camera as CameraModel, Site, Zone
 from auth.password import hash_password, verify_password
 from auth.jwt_handler import create_token
 from auth.dependencies import get_current_user
@@ -38,6 +38,8 @@ app.mount("/screenshots", StaticFiles(directory="incidents"), name="screenshots"
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+
+ZONE_COLORS = ["#00D4FF", "#00E676", "#FFB300", "#7C3AED", "#FF4444", "#FF6B6B", "#818cf8", "#f472b6"]
 
 
 def _parse_source(src):
@@ -104,7 +106,6 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
     existing = db.query(User).filter(User.email == body.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
-    # Create a new site for this user
     site = Site(name=body.site_name, location="")
     db.add(site)
     db.flush()
@@ -138,7 +139,7 @@ def me(current_user: User = Depends(get_current_user)):
 
 
 # ============================================================
-# USER MANAGEMENT (Task 2)
+# USER MANAGEMENT
 # ============================================================
 
 @app.post("/api/users/invite")
@@ -194,6 +195,120 @@ def get_users(
 
 
 # ============================================================
+# ZONES (DB-backed, site-scoped)
+# ============================================================
+
+@app.get("/api/zones")
+def get_zones(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    zones = db.query(Zone).filter(Zone.site_id == current_user.site_id).all()
+    return [
+        {
+            "id": z.id,
+            "name": z.name,
+            "polygon": z.polygon,
+            "color": z.color,
+            "camera_id": z.camera_id,
+            "created_at": z.created_at.isoformat() if z.created_at else None,
+        }
+        for z in zones
+    ]
+
+
+@app.post("/api/zones")
+async def create_zone(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Viewers cannot create zones")
+    body = await request.json()
+    name = body.get("name", "").strip()
+    polygon = body.get("polygon", [])
+    camera_id = body.get("camera_id", None)
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    if len(polygon) < 3:
+        raise HTTPException(status_code=400, detail="polygon must have at least 3 points")
+    count = db.query(Zone).filter(Zone.site_id == current_user.site_id).count()
+    color = body.get("color", ZONE_COLORS[count % len(ZONE_COLORS)])
+    zone = Zone(
+        site_id=current_user.site_id,
+        camera_id=None,
+        created_by=current_user.id,
+        name=name,
+        polygon=polygon,
+        color=color,
+    )
+    db.add(zone)
+    db.commit()
+    db.refresh(zone)
+    return {
+        "id": zone.id,
+        "name": zone.name,
+        "polygon": zone.polygon,
+        "color": zone.color,
+        "camera_id": zone.camera_id,
+        "created_at": zone.created_at.isoformat() if zone.created_at else None,
+    }
+
+
+@app.put("/api/zones/{zone_id}")
+async def update_zone(
+    zone_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Viewers cannot edit zones")
+    zone = db.query(Zone).filter(
+        Zone.id == zone_id,
+        Zone.site_id == current_user.site_id
+    ).first()
+    if not zone:
+        raise HTTPException(status_code=404, detail="Zone not found")
+    body = await request.json()
+    if "name" in body:
+        zone.name = body["name"].strip()
+    if "polygon" in body:
+        zone.polygon = body["polygon"]
+    if "color" in body:
+        zone.color = body["color"]
+    db.commit()
+    db.refresh(zone)
+    return {
+        "id": zone.id,
+        "name": zone.name,
+        "polygon": zone.polygon,
+        "color": zone.color,
+        "camera_id": zone.camera_id,
+    }
+
+
+@app.delete("/api/zones/{zone_id}")
+def delete_zone(
+    zone_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Viewers cannot delete zones")
+    zone = db.query(Zone).filter(
+        Zone.id == zone_id,
+        Zone.site_id == current_user.site_id
+    ).first()
+    if not zone:
+        raise HTTPException(status_code=404, detail="Zone not found")
+    db.delete(zone)
+    db.commit()
+    return {"status": "deleted", "zone_id": zone_id}
+
+
+# ============================================================
 # CORE ENDPOINTS
 # ============================================================
 
@@ -236,7 +351,6 @@ def get_incidents(
     except Exception:
         pass
 
-    # fallback to JSON file
     incidents_file = Path("incidents.json")
     if not incidents_file.exists():
         return []
@@ -323,6 +437,7 @@ def get_rules(
             "pipeline_id": r.pipeline_id,
             "status": r.status,
             "severity": r.severity,
+            "zone_id": r.zone_id,
             "created_at": r.created_at.isoformat() if r.created_at else None,
         }
         for r in rules
@@ -431,11 +546,17 @@ async def generate_rule(request: Request):
     try:
         body = await request.json()
         instruction = body.get("instruction", "").strip()
+        existing_zones = body.get("existing_zones", [])
 
         if not instruction:
             raise HTTPException(status_code=400, detail="instruction is required")
 
-        full_prompt = f"{SYSTEM_PROMPT}\n\nUser instruction: {instruction}\n\nJSON output:"
+        zone_context = ""
+        if existing_zones:
+            zone_names = [z["name"] for z in existing_zones]
+            zone_context = f"\n\nEXISTING ZONES FOR THIS SITE: {', '.join(zone_names)}\nWhen the user references one of these zone names, use it directly in the output instead of generating new coords."
+
+        full_prompt = f"{SYSTEM_PROMPT}{zone_context}\n\nUser instruction: {instruction}\n\nJSON output:"
 
         response = requests.post(
             OLLAMA_URL,
@@ -539,7 +660,6 @@ async def apply_rule(request: Request, db: Session = Depends(get_db),
         if current_user.role != "admin":
             raise HTTPException(status_code=403, detail="Viewers cannot apply rules")
 
-        # Save rule to DB with current user's site
         try:
             rule = Rule(
                 site_id=current_user.site_id,
