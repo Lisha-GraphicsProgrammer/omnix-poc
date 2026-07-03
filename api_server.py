@@ -15,6 +15,10 @@ import subprocess
 import sys
 from pathlib import Path
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
+from collections import defaultdict
+import csv
+import io
 
 from db.session import get_db
 from db.models import User, Rule, Incident, Camera as CameraModel, Site, Zone
@@ -373,7 +377,6 @@ def review_incident(
     incident = db.query(Incident).filter(Incident.id == incident_id).first()
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
-    from datetime import datetime
     incident.reviewed = True
     incident.review_status = "reviewed"
     incident.reviewed_by = current_user.id
@@ -982,3 +985,387 @@ def flush_alerts():
 @app.post("/api/danger/reset-tracks")
 def reset_tracks():
     return {"status": "tracks_reset", "note": "Restart run_pipeline.py to fully reset ByteTrack state"}
+
+
+# ============================================================
+# ANALYTICS
+# ============================================================
+
+def get_date_range(from_date: str = None, to_date: str = None):
+    if not from_date:
+        from_dt = datetime.utcnow() - timedelta(days=7)
+    else:
+        from_dt = datetime.strptime(from_date, "%Y-%m-%d")
+    if not to_date:
+        to_dt = datetime.utcnow()
+    else:
+        to_dt = datetime.strptime(to_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    return from_dt, to_dt
+
+
+def get_incidents_in_range(db: Session, site_id: int, from_dt: datetime, to_dt: datetime):
+    return db.query(Incident).filter(
+        Incident.site_id == site_id,
+        Incident.timestamp >= from_dt,
+        Incident.timestamp <= to_dt
+    ).all()
+
+
+@app.get("/api/analytics/incidents-over-time")
+def incidents_over_time(
+    period: str = "day",
+    from_date: str = None,
+    to_date: str = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    from_dt, to_dt = get_date_range(from_date, to_date)
+    incidents = get_incidents_in_range(db, current_user.site_id, from_dt, to_dt)
+
+    counts = defaultdict(int)
+    for inc in incidents:
+        if inc.timestamp:
+            if period == "day":
+                key = inc.timestamp.strftime("%Y-%m-%d")
+            elif period == "week":
+                key = inc.timestamp.strftime("%Y-W%W")
+            else:
+                key = inc.timestamp.strftime("%Y-%m")
+            counts[key] += 1
+
+    result = []
+    cur = from_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    while cur <= to_dt:
+        if period == "day":
+            key = cur.strftime("%Y-%m-%d")
+            cur += timedelta(days=1)
+        elif period == "week":
+            key = cur.strftime("%Y-W%W")
+            cur += timedelta(weeks=1)
+        else:
+            key = cur.strftime("%Y-%m")
+            if cur.month == 12:
+                cur = cur.replace(year=cur.year + 1, month=1)
+            else:
+                cur = cur.replace(month=cur.month + 1)
+        result.append({"date": key, "count": counts.get(key, 0)})
+
+    return result
+
+
+@app.get("/api/analytics/incidents-by-rule")
+def incidents_by_rule(
+    from_date: str = None,
+    to_date: str = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    from_dt, to_dt = get_date_range(from_date, to_date)
+    incidents = get_incidents_in_range(db, current_user.site_id, from_dt, to_dt)
+
+    counts = defaultdict(lambda: {"count": 0, "severity": "high"})
+    for inc in incidents:
+        rule_name = inc.violation_type or "unknown"
+        counts[rule_name]["count"] += 1
+        counts[rule_name]["severity"] = inc.severity or "high"
+
+    result = [
+        {"rule_name": k, "count": v["count"], "severity": v["severity"]}
+        for k, v in counts.items()
+    ]
+    result.sort(key=lambda x: x["count"], reverse=True)
+    return result[:10]
+
+
+@app.get("/api/analytics/incidents-by-hour")
+def incidents_by_hour(
+    from_date: str = None,
+    to_date: str = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    from_dt, to_dt = get_date_range(from_date, to_date)
+    incidents = get_incidents_in_range(db, current_user.site_id, from_dt, to_dt)
+
+    counts = defaultdict(int)
+    for inc in incidents:
+        if inc.timestamp:
+            counts[inc.timestamp.hour] += 1
+
+    return [{"hour": h, "count": counts.get(h, 0)} for h in range(24)]
+
+
+@app.get("/api/analytics/false-positive-rate")
+def false_positive_rate(
+    from_date: str = None,
+    to_date: str = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    from_dt, to_dt = get_date_range(from_date, to_date)
+    incidents = get_incidents_in_range(db, current_user.site_id, from_dt, to_dt)
+
+    rule_data = defaultdict(lambda: {"tp": 0, "fp": 0})
+    for inc in incidents:
+        rule_name = inc.violation_type or "unknown"
+        if inc.review_status == "false_positive":
+            rule_data[rule_name]["fp"] += 1
+        else:
+            rule_data[rule_name]["tp"] += 1
+
+    result = []
+    for rule_name, data in rule_data.items():
+        total = data["tp"] + data["fp"]
+        rate = round((data["fp"] / total) * 100, 1) if total > 0 else 0.0
+        result.append({
+            "rule_name": rule_name,
+            "tp_count": data["tp"],
+            "fp_count": data["fp"],
+            "total": total,
+            "rate": rate,
+        })
+
+    result.sort(key=lambda x: x["rate"], reverse=True)
+    return result
+
+
+# ============================================================
+# EXPORT (CSV + PDF)
+# ============================================================
+
+@app.get("/api/export/incidents")
+def export_incidents(
+    format: str = "csv",
+    from_date: str = None,
+    to_date: str = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can export data")
+
+    from_dt, to_dt = get_date_range(from_date, to_date)
+    incidents = get_incidents_in_range(db, current_user.site_id, from_dt, to_dt)
+    incidents.sort(key=lambda x: x.timestamp or datetime.min, reverse=True)
+
+    site_name = _settings["platform"].get("site_name", "Site").replace(" ", "_").replace("—", "-")
+    from_str = from_dt.strftime("%Y-%m-%d")
+    to_str = to_dt.strftime("%Y-%m-%d")
+    filename_base = f"omnix_report_{site_name}_{from_str}_to_{to_str}"
+
+    if format == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "id", "timestamp", "rule_name", "severity", "zone",
+            "camera", "alert_message", "review_status",
+            "reviewed_by", "screenshot_url"
+        ])
+        for inc in incidents:
+            screenshot_url = ""
+            if inc.screenshot_path:
+                filename = inc.screenshot_path.replace("incidents/", "")
+                screenshot_url = f"http://localhost:8000/screenshots/{filename}"
+            writer.writerow([
+                inc.id,
+                inc.timestamp.isoformat() if inc.timestamp else "",
+                inc.violation_type or "",
+                inc.severity or "",
+                inc.zone or "",
+                "Camera 1",
+                inc.alert_message or "",
+                inc.review_status or "",
+                inc.reviewed_by or "",
+                screenshot_url,
+            ])
+
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename_base}.csv"'}
+        )
+
+    elif format == "pdf":
+        try:
+            from reportlab.lib.pagesizes import landscape, A4
+            from reportlab.lib import colors
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.units import cm
+            from reportlab.platypus import (
+                SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+            )
+            from reportlab.lib.enums import TA_CENTER, TA_LEFT
+        except ImportError:
+            raise HTTPException(status_code=500, detail="reportlab not installed. Run: pip install reportlab")
+
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=landscape(A4),
+            rightMargin=1.5 * cm,
+            leftMargin=1.5 * cm,
+            topMargin=2 * cm,
+            bottomMargin=2 * cm,
+        )
+
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle("Title", parent=styles["Heading1"], fontSize=18, alignment=TA_CENTER, textColor=colors.HexColor("#1a1a2e"), spaceAfter=6)
+        subtitle_style = ParagraphStyle("Sub", parent=styles["Normal"], fontSize=10, alignment=TA_CENTER, textColor=colors.HexColor("#6366f1"), spaceAfter=4)
+        section_style = ParagraphStyle("Section", parent=styles["Heading2"], fontSize=13, textColor=colors.HexColor("#1a1a2e"), spaceBefore=14, spaceAfter=6)
+        normal_style = ParagraphStyle("Body", parent=styles["Normal"], fontSize=9, textColor=colors.HexColor("#374151"))
+        cell_style = ParagraphStyle("Cell", parent=styles["Normal"], fontSize=8, textColor=colors.HexColor("#374151"), wordWrap="CJK")
+
+        story = []
+
+        # Header
+        story.append(Paragraph("OMNIX Safety Report", title_style))
+        site_display = _settings["platform"].get("site_name", "Site A")
+        story.append(Paragraph(f"{site_display} · {from_str} to {to_str}", subtitle_style))
+        story.append(Paragraph(
+            f"Generated for {current_user.name or current_user.email} on {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+            subtitle_style
+        ))
+        story.append(Spacer(1, 0.5 * cm))
+
+        # Summary section
+        story.append(Paragraph("Summary", section_style))
+
+        total = len(incidents)
+        sev_counts = defaultdict(int)
+        rule_counts = defaultdict(int)
+        for inc in incidents:
+            sev_counts[inc.severity or "unknown"] += 1
+            rule_counts[inc.violation_type or "unknown"] += 1
+
+        days_diff = max((to_dt - from_dt).days, 1)
+        avg_per_day = round(total / days_diff, 1)
+
+        summary_data = [
+            ["Metric", "Value"],
+            ["Total Incidents", str(total)],
+            ["Date Range", f"{from_str} to {to_str}"],
+            ["Avg per Day", str(avg_per_day)],
+            ["Critical", str(sev_counts.get("critical", 0))],
+            ["High", str(sev_counts.get("high", 0))],
+            ["Medium", str(sev_counts.get("medium", 0))],
+            ["Unique Rules Triggered", str(len(rule_counts))],
+        ]
+
+        summary_table = Table(summary_data, colWidths=[6 * cm, 6 * cm])
+        summary_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#6366f1")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 10),
+            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+            ("FONTSIZE", (0, 1), (-1, -1), 9),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#f9fafb"), colors.white]),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e5e7eb")),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        story.append(summary_table)
+        story.append(Spacer(1, 0.5 * cm))
+
+        # Top rules breakdown
+        if rule_counts:
+            story.append(Paragraph("Incidents by Rule", section_style))
+            rule_data = [["Rule", "Count"]]
+            for rule, count in sorted(rule_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
+                rule_data.append([rule.replace("_", " ").title(), str(count)])
+            rule_table = Table(rule_data, colWidths=[10 * cm, 4 * cm])
+            rule_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#6366f1")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), 10),
+                ("ALIGN", (1, 0), (1, -1), "CENTER"),
+                ("FONTSIZE", (0, 1), (-1, -1), 9),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#f9fafb"), colors.white]),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e5e7eb")),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]))
+            story.append(rule_table)
+            story.append(Spacer(1, 0.5 * cm))
+
+        # Incidents table (up to 500)
+        story.append(PageBreak())
+        story.append(Paragraph("Incident Log", section_style))
+
+        page_w = landscape(A4)[0] - 3 * cm
+        col_widths = [
+            page_w * 0.05,  # ID
+            page_w * 0.13,  # Timestamp
+            page_w * 0.18,  # Rule
+            page_w * 0.08,  # Severity
+            page_w * 0.13,  # Zone
+            page_w * 0.10,  # Camera
+            page_w * 0.23,  # Message
+            page_w * 0.10,  # Status
+        ]
+
+        table_data = [["ID", "Timestamp", "Rule", "Severity", "Zone", "Camera", "Message", "Status"]]
+        for inc in incidents[:500]:
+            table_data.append([
+                str(inc.id),
+                inc.timestamp.strftime("%Y-%m-%d %H:%M") if inc.timestamp else "",
+                Paragraph((inc.violation_type or "").replace("_", " ").title(), cell_style),
+                (inc.severity or "").capitalize(),
+                Paragraph((inc.zone or "").replace("_", " ").title(), cell_style),
+                "Camera 1",
+                Paragraph(inc.alert_message or "", cell_style),
+                (inc.review_status or "pending").capitalize(),
+            ])
+
+        inc_table = Table(table_data, colWidths=col_widths, repeatRows=1)
+
+        sev_colors = {
+            "critical": colors.HexColor("#fca5a5"),
+            "high": colors.HexColor("#fbbf24"),
+            "medium": colors.HexColor("#818cf8"),
+        }
+
+        inc_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e1b4b")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 9),
+            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("FONTSIZE", (0, 1), (-1, -1), 8),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#f9fafb"), colors.white]),
+            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#e5e7eb")),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+
+        story.append(inc_table)
+
+        # Page numbers via onPage callback
+        def add_page_number(canvas, doc):
+            canvas.saveState()
+            canvas.setFont("Helvetica", 8)
+            canvas.setFillColor(colors.HexColor("#6b7280"))
+            page_num = f"Page {doc.page} — OMNIX Safety Report — {site_display}"
+            canvas.drawCentredString(landscape(A4)[0] / 2, 1 * cm, page_num)
+            canvas.restoreState()
+
+        doc.build(story, onFirstPage=add_page_number, onLaterPages=add_page_number)
+        buffer.seek(0)
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename_base}.pdf"'}
+        )
+
+    else:
+        raise HTTPException(status_code=400, detail="format must be 'csv' or 'pdf'")
