@@ -323,14 +323,26 @@ def root():
 
 @app.get("/api/incidents")
 def get_incidents(
+    limit: int = 50,
+    offset: int = 0,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    limit = max(1, min(limit, 200))   # clamp to sane bounds
+    offset = max(0, offset)
+
     try:
-        incidents = db.query(Incident).filter(
+        base_q = db.query(Incident).filter(
             Incident.site_id == current_user.site_id
-        ).order_by(Incident.timestamp.desc()).limit(200).all()
-        if incidents:
+        )
+        total = base_q.count()
+        if total > 0:
+            incidents = (
+                base_q.order_by(Incident.timestamp.desc())
+                .offset(offset)
+                .limit(limit)
+                .all()
+            )
             result = []
             for inc in incidents:
                 d = {
@@ -351,20 +363,22 @@ def get_incidents(
                     filename = inc.screenshot_path.replace("incidents/", "")
                     d["screenshot_url"] = f"http://localhost:8000/screenshots/{filename}"
                 result.append(d)
-            return result
+            return {"items": result, "total": total, "limit": limit, "offset": offset}
     except Exception:
         pass
 
+    # JSON fallback (no DB) — same envelope
     incidents_file = Path("incidents.json")
     if not incidents_file.exists():
-        return []
+        return {"items": [], "total": 0, "limit": limit, "offset": offset}
     with open(incidents_file, "r") as f:
         incidents = json.load(f)
     for inc in incidents:
         if "screenshot_path" in inc:
             filename = inc["screenshot_path"].replace("incidents/", "")
             inc["screenshot_url"] = f"http://localhost:8000/screenshots/{filename}"
-    return incidents
+    total = len(incidents)
+    return {"items": incidents[offset:offset + limit], "total": total, "limit": limit, "offset": offset}
 
 
 @app.post("/api/incidents/{incident_id}/review")
