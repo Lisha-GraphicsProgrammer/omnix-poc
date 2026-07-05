@@ -204,10 +204,14 @@ def get_users(
 
 @app.get("/api/zones")
 def get_zones(
+    camera_id: int = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    zones = db.query(Zone).filter(Zone.site_id == current_user.site_id).all()
+    q = db.query(Zone).filter(Zone.site_id == current_user.site_id)
+    if camera_id is not None:
+        q = q.filter(Zone.camera_id == camera_id)
+    zones = q.all()
     return [
         {
             "id": z.id,
@@ -241,7 +245,7 @@ async def create_zone(
     color = body.get("color", ZONE_COLORS[count % len(ZONE_COLORS)])
     zone = Zone(
         site_id=current_user.site_id,
-        camera_id=None,
+        camera_id=camera_id,
         created_by=current_user.id,
         name=name,
         polygon=polygon,
@@ -353,6 +357,7 @@ def get_incidents(
                     "severity": inc.severity,
                     "alert_message": inc.alert_message,
                     "person_id": inc.person_track_id,
+                    "frame": inc.frame_number,
                     "bbox": inc.bbox,
                     "detected_objects": inc.detected_objects,
                     "missing_gear": inc.missing_gear,
@@ -558,7 +563,7 @@ Output ONLY the JSON. No markdown code fences, no explanation, no preamble."""
 
 
 @app.post("/api/rules/generate")
-async def generate_rule(request: Request):
+async def generate_rule(request: Request, db: Session = Depends(get_db)):
     response_text = ""
     try:
         body = await request.json()
@@ -568,9 +573,22 @@ async def generate_rule(request: Request):
         if not instruction:
             raise HTTPException(status_code=400, detail="instruction is required")
 
+        camera_id = body.get("camera_id")
+        zone_names = []
+        if camera_id is not None:
+            try:
+                zone_names = [
+                    z.name for z in
+                    db.query(Zone).filter(Zone.camera_id == camera_id).all()
+                ]
+            except Exception:
+                zone_names = []
+        if not zone_names and existing_zones:
+            zone_names = [z["name"] for z in existing_zones
+                          if isinstance(z, dict) and "name" in z]
+
         zone_context = ""
-        if existing_zones:
-            zone_names = [z["name"] for z in existing_zones]
+        if zone_names:
             zone_context = f"\n\nEXISTING ZONES FOR THIS SITE: {', '.join(zone_names)}\nWhen the user references one of these zone names, use it directly in the output instead of generating new coords."
 
         full_prompt = f"{SYSTEM_PROMPT}{zone_context}\n\nUser instruction: {instruction}\n\nJSON output:"
@@ -614,6 +632,31 @@ async def generate_rule(request: Request):
         raise HTTPException(status_code=500, detail=f"LLM returned invalid JSON: {str(e)}. Raw: {response_text[:500]}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def enrich_zone_coords(config: dict, db: Session, site_id: int) -> dict:
+    """Replace LLM-default zone coords with user-drawn polygons from the DB
+    when the zone name matches. Marks them 'user_drawn' so run_pipeline.py
+    knows to scale them from snapshot space (854x480) to video resolution."""
+    zones = config.get("zones", [])
+    if not zones:
+        return config
+    try:
+        db_zones = {
+            z.name: z.polygon
+            for z in db.query(Zone).filter(Zone.site_id == site_id).all()
+        }
+    except Exception as e:
+        print(f"[OMNIX] Zone enrichment skipped (DB error): {e}")
+        return config
+    for zone in zones:
+        name = zone.get("name")
+        polygon = db_zones.get(name)
+        if polygon and len(polygon) >= 3:
+            zone["coords"] = polygon
+            zone["source"] = "user_drawn"
+            print(f"[OMNIX] Zone '{name}': using user-drawn polygon ({len(polygon)} points)")
+    return config
 
 
 def merge_configs(existing: dict, new_cfg: dict) -> dict:
@@ -708,6 +751,9 @@ async def apply_rule(request: Request, db: Session = Depends(get_db),
         else:
             merged = new_config
             print(f"[OMNIX] New pipeline config → {merged['pipeline_id']}")
+
+        # Substitute user-drawn polygon coords for matching zone names
+        merged = enrich_zone_coords(merged, db, current_user.site_id)
 
         with open(config_path, "w") as f:
             json.dump(merged, f, indent=2)
@@ -889,14 +935,26 @@ def generate_frames():
             time.sleep(sleep_time)
 
 
+def generate_placeholder_frames():
+    placeholder = np.zeros((480, 854, 3), dtype=np.uint8)
+    cv2.putText(placeholder, "NO SIGNAL", (320, 240),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (80, 80, 80), 2)
+    ret, buffer = cv2.imencode('.jpg', placeholder, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    payload = (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+    while True:
+        yield payload
+        time.sleep(0.5)
+
+
 @app.get("/api/video/stream")
-def video_stream_endpoint():
-    return StreamingResponse(generate_frames(), media_type="multipart/x-mixed-replace;boundary=frame")
+def video_stream_endpoint(camera_id: int = 1):
+    gen = generate_frames() if camera_id == 1 else generate_placeholder_frames()
+    return StreamingResponse(gen, media_type="multipart/x-mixed-replace;boundary=frame")
 
 
 @app.get("/api/video/snapshot")
-def video_snapshot():
-    frame = video_stream.read()
+def video_snapshot(camera_id: int = 1):
+    frame = video_stream.read() if camera_id == 1 else None
     if frame is None:
         placeholder = np.zeros((480, 854, 3), dtype=np.uint8)
         cv2.putText(placeholder, "NO SIGNAL", (320, 240),
