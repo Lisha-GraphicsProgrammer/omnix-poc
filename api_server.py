@@ -243,6 +243,23 @@ async def create_zone(
         raise HTTPException(status_code=400, detail="polygon must have at least 3 points")
     count = db.query(Zone).filter(Zone.site_id == current_user.site_id).count()
     color = body.get("color", ZONE_COLORS[count % len(ZONE_COLORS)])
+
+    # POC: the camera registry is hardcoded in /api/cameras and not persisted,
+    # so ensure a matching cameras row exists before the zone references it.
+    if camera_id is not None:
+        cam = db.query(CameraModel).filter(CameraModel.id == camera_id).first()
+        if cam is None:
+            cam = CameraModel(
+                id=camera_id,
+                site_id=current_user.site_id,
+                name=f"Camera {camera_id}",
+                location="",
+                source="default",
+                status="online" if camera_id == 1 else "offline",
+            )
+            db.add(cam)
+            db.flush()
+
     zone = Zone(
         site_id=current_user.site_id,
         camera_id=camera_id,
