@@ -1,5 +1,6 @@
 import json
 import cv2
+import numpy as np
 from datetime import datetime
 from pathlib import Path
 from ultralytics import YOLO
@@ -183,6 +184,24 @@ def _append_json(incident: dict):
 
 
 # ============================================================
+# HELPER: point in polygon (ray casting)
+# ============================================================
+def point_in_polygon(x: float, y: float, poly) -> bool:
+    """True if point (x, y) is inside polygon [[x, y], ...]. Ray-casting."""
+    if not poly or len(poly) < 3:
+        return False
+    inside = False
+    j = len(poly) - 1
+    for i in range(len(poly)):
+        xi, yi = poly[i][0], poly[i][1]
+        xj, yj = poly[j][0], poly[j][1]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+# ============================================================
 # HELPER: bbox overlap
 # ============================================================
 def bbox_overlap(box1, box2):
@@ -229,6 +248,8 @@ def check_required_gear(person_bbox, frame, required_gear, loaded_models):
 # ============================================================
 # BUILD ZONE LOOKUP
 # ============================================================
+# UI-drawn zones ("source": "user_drawn") are in 854x480 snapshot space and
+# get scaled to the video's native resolution once we know it (below).
 zones_map = {}
 for zone in config.get('zones', []):
     coords = zone['coords']
@@ -238,6 +259,8 @@ for zone in config.get('zones', []):
         'y_min': min(p[1] for p in coords),
         'y_max': max(p[1] for p in coords),
         'coords': coords,
+        'source': zone.get('source', 'llm_default'),
+        'poly': coords,  # replaced with scaled coords after video open
     }
 
 rules = config.get('rules', [])
@@ -265,6 +288,20 @@ ORIG_W = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 ORIG_H = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 _cap.release()
 print(f"[INFO] Original video resolution: {ORIG_W}x{ORIG_H}\n")
+
+# Scale user-drawn zone polygons from snapshot space (854x480) to native res
+SNAP_W, SNAP_H = 854, 480
+for zn, zd in zones_map.items():
+    if zd['source'] == 'user_drawn' and ORIG_W and ORIG_H:
+        sx, sy = ORIG_W / SNAP_W, ORIG_H / SNAP_H
+        zd['poly'] = [[p[0] * sx, p[1] * sy] for p in zd['coords']]
+        zd['x_min'] = min(p[0] for p in zd['poly'])
+        zd['x_max'] = max(p[0] for p in zd['poly'])
+        zd['y_min'] = min(p[1] for p in zd['poly'])
+        zd['y_max'] = max(p[1] for p in zd['poly'])
+        print(f"[ZONE] '{zn}' user-drawn polygon scaled to native res ({len(zd['poly'])} points)")
+    else:
+        zd['poly'] = zd['coords']
 
 # ============================================================
 # MAIN PROCESSING LOOP
@@ -297,10 +334,7 @@ for frame_idx, result in enumerate(results):
             rule_type     = rule.get('type', '')
             required_gear = rule.get('required', [])
 
-            in_zone = (
-                zone['x_min'] <= person_center_x <= zone['x_max'] and
-                zone['y_min'] <= person_bottom_y <= zone['y_max']
-            )
+            in_zone = point_in_polygon(person_center_x, person_bottom_y, zone['poly'])
 
             cooldown_key = (rule_idx, person_id)
 
@@ -352,10 +386,8 @@ for frame_idx, result in enumerate(results):
 
                 for zn, zd in zones_map.items():
                     color = (0, 255, 255) if zn == zone_name else (0, 180, 180)
-                    cv2.rectangle(orig_frame,
-                                  (int(zd['x_min']), int(zd['y_min'])),
-                                  (int(zd['x_max']), int(zd['y_max'])),
-                                  color, 2)
+                    pts = np.array(zd['poly'], dtype=np.int32).reshape((-1, 1, 2))
+                    cv2.polylines(orig_frame, [pts], isClosed=True, color=color, thickness=2)
                     cv2.putText(orig_frame, zn.replace("_", " ").upper(),
                                 (int(zd['x_min']) + 4, int(zd['y_min']) + 18),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
