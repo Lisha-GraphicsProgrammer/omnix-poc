@@ -398,22 +398,34 @@ def get_incidents(
     return {"items": incidents[offset:offset + limit], "total": total, "limit": limit, "offset": offset}
 
 
+ALLOWED_REVIEW_STATUSES = {"reviewed", "false_positive", "dismissed"}
+
 @app.post("/api/incidents/{incident_id}/review")
-def review_incident(
+async def review_incident(
     incident_id: int,
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    incident = db.query(Incident).filter(
+        Incident.id == incident_id,
+        Incident.site_id == current_user.site_id,
+    ).first()
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    review_status = str(body.get("review_status") or "reviewed").strip()
+    if review_status not in ALLOWED_REVIEW_STATUSES:
+        raise HTTPException(status_code=400, detail=f"review_status must be one of: {', '.join(sorted(ALLOWED_REVIEW_STATUSES))}")
     incident.reviewed = True
-    incident.review_status = "reviewed"
+    incident.review_status = review_status
     incident.reviewed_by = current_user.id
     incident.reviewed_at = datetime.utcnow()
     db.commit()
-    return {"status": "ok", "incident_id": incident_id}
+    return {"status": "ok", "incident_id": incident_id, "review_status": review_status}
 
 
 # ── A: auth added ──
