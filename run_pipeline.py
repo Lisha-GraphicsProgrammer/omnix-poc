@@ -19,18 +19,21 @@ from db.models import Incident, Rule, Site, Camera as CameraModel
 with open('pipeline_config.json', 'r') as f:
     config = json.load(f)
 
+# ── Part 1: Read persistence_frames from config (default 5) ──
+PERSISTENCE_FRAMES = int(config.get('persistence_frames', 5))
+
 print(f"\n{'='*60}")
 print(f"Pipeline: {config['pipeline_id']}")
 print(f"Description: {config['description']}")
 print(f"Zones: {len(config.get('zones', []))}")
 print(f"Rules: {len(config.get('rules', []))}")
+print(f"Persistence frames: {PERSISTENCE_FRAMES}")
 print(f"{'='*60}\n")
 
 # ============================================================
 # LOAD DB REFERENCES
 # ============================================================
 def get_db_refs():
-    """Get site_id, camera_id, rule_id from DB for incident writing."""
     try:
         db = SessionLocal()
         site = db.query(Site).first()
@@ -39,7 +42,6 @@ def get_db_refs():
             Rule.pipeline_id == config['pipeline_id'],
             Rule.status == 'active'
         ).first()
-        # fallback: get any active rule
         if not rule:
             rule = db.query(Rule).filter(Rule.status == 'active').first()
         db.close()
@@ -63,12 +65,15 @@ with open('model_registry.json', 'r') as f:
 
 print(f"[INFO] Model registry loaded: {list(registry.keys())}")
 
+# ── Part 2: Helper to get per-model conf_threshold ──
+def get_model_conf(model_name: str, fallback: float = 0.5) -> float:
+    entry = registry.get(model_name, {})
+    return float(entry.get('conf_threshold', entry.get('confidence', fallback)))
+
 def load_model_from_registry(model_name: str) -> YOLO | None:
-    """Load a model by name from the registry. Returns None if not available."""
     if model_name not in registry:
         print(f"  [WARN] '{model_name}' not in registry")
         return None
-
     entry = registry[model_name]
     model_type = entry.get("type", "custom")
 
@@ -79,7 +84,7 @@ def load_model_from_registry(model_name: str) -> YOLO | None:
             return None
         try:
             m = YOLO(model_path)
-            print(f"  [OK] Loaded {model_name} (COCO class {entry.get('class_id')}) from {model_path}")
+            print(f"  [OK] Loaded {model_name} (COCO class {entry.get('class_id')}) from {model_path} [conf={get_model_conf(model_name)}]")
             return m
         except Exception as e:
             print(f"  [FAIL] {model_name}: {e}")
@@ -92,7 +97,7 @@ def load_model_from_registry(model_name: str) -> YOLO | None:
             return None
         try:
             m = YOLO(weights)
-            print(f"  [OK] Loaded {model_name} from {weights}")
+            print(f"  [OK] Loaded {model_name} from {weights} [conf={get_model_conf(model_name)}]")
             return m
         except Exception as e:
             print(f"  [FAIL] {model_name}: {e}")
@@ -117,11 +122,12 @@ for model_name in needed_models:
     if m is not None:
         models[model_name] = m
 
-base_entry = registry.get("person", {})
+base_entry   = registry.get("person", {})
 base_model_path = base_entry.get("model", "yolov8n.pt")
-base_conf = base_entry.get("confidence", 0.5)
-base_model = YOLO(base_model_path)
-print(f"\n[OK] Loaded base YOLO for person detection (conf={base_conf})")
+# ── Part 2: use conf_threshold for person model ──
+base_conf    = get_model_conf("person", fallback=0.5)
+base_model   = YOLO(base_model_path)
+print(f"\n[OK] Loaded base YOLO for person detection (conf_threshold={base_conf})")
 print(f"[INFO] Total models loaded: {list(models.keys())}\n")
 
 # ============================================================
@@ -130,8 +136,6 @@ print(f"[INFO] Total models loaded: {list(models.keys())}\n")
 INCIDENTS_FILE = Path('incidents.json')
 
 def append_incident(incident: dict):
-    """Write to DB first, fall back to JSON."""
-    # --- DB write ---
     if rule_id and site_id:
         try:
             db = SessionLocal()
@@ -164,7 +168,6 @@ def append_incident(incident: dict):
 
 
 def _append_json(incident: dict):
-    """JSON fallback writer."""
     if INCIDENTS_FILE.exists():
         try:
             with open(INCIDENTS_FILE, 'r') as f:
@@ -180,14 +183,10 @@ def _append_json(incident: dict):
     tmp.replace(INCIDENTS_FILE)
 
 
-
-
-
 # ============================================================
 # HELPER: point in polygon (ray casting)
 # ============================================================
 def point_in_polygon(x: float, y: float, poly) -> bool:
-    """True if point (x, y) is inside polygon [[x, y], ...]. Ray-casting."""
     if not poly or len(poly) < 3:
         return False
     inside = False
@@ -225,7 +224,8 @@ def check_required_gear(person_bbox, frame, required_gear, loaded_models):
             print(f"  [WARN] Required gear '{gear_name}' not loaded, skipping")
             continue
         entry = registry.get(gear_name, {})
-        conf = entry.get("confidence", 0.4)
+        # ── Part 2: use conf_threshold per gear model ──
+        conf = get_model_conf(gear_name, fallback=0.5)
 
         if entry.get("type") == "coco_default":
             class_id = entry.get("class_id", 0)
@@ -248,8 +248,6 @@ def check_required_gear(person_bbox, frame, required_gear, loaded_models):
 # ============================================================
 # BUILD ZONE LOOKUP
 # ============================================================
-# UI-drawn zones ("source": "user_drawn") are in 854x480 snapshot space and
-# get scaled to the video's native resolution once we know it (below).
 zones_map = {}
 for zone in config.get('zones', []):
     coords = zone['coords']
@@ -260,7 +258,7 @@ for zone in config.get('zones', []):
         'y_max': max(p[1] for p in coords),
         'coords': coords,
         'source': zone.get('source', 'llm_default'),
-        'poly': coords,  # replaced with scaled coords after video open
+        'poly': coords,
     }
 
 rules = config.get('rules', [])
@@ -278,7 +276,13 @@ if INCIDENTS_FILE.exists():
     INCIDENTS_FILE.unlink()
 
 incident_count = 0
+
+# ── Part 1: Cooldown tracker (existing) ──
 active_violations = {}
+
+# ── Part 1: Streak counter — tracks consecutive violation frames per (person_id, rule_idx) ──
+# streak_counters[key] = number of consecutive frames with violation
+streak_counters = {}
 
 video = 'test_video.mp4'
 print(f"Processing {video}...")
@@ -330,7 +334,7 @@ for frame_idx, result in enumerate(results):
             if zone_name not in zones_map:
                 continue
 
-            zone = zones_map[zone_name]
+            zone          = zones_map[zone_name]
             rule_type     = rule.get('type', '')
             required_gear = rule.get('required', [])
 
@@ -339,11 +343,16 @@ for frame_idx, result in enumerate(results):
             cooldown_key = (rule_idx, person_id)
 
             if not in_zone:
+                # ── Part 1: reset streak when person leaves zone ──
+                if cooldown_key in streak_counters:
+                    del streak_counters[cooldown_key]
+                # cleanup stale cooldown
                 if cooldown_key in active_violations:
                     if frame_idx - active_violations[cooldown_key] > 150:
                         del active_violations[cooldown_key]
                 continue
 
+            # Check violation condition
             violation_occurred = False
             violation_type     = rule_type
             missing_gear       = []
@@ -363,60 +372,84 @@ for frame_idx, result in enumerate(results):
                 violation_occurred = True
                 violation_type = "person_in_zone"
 
-            if violation_occurred and cooldown_key not in active_violations:
-                incident_count += 1
-                incident_id     = f"inc_{incident_count:04d}"
-                screenshot_path = f"incidents/{incident_id}.jpg"
+            if violation_occurred:
+                # ── Part 1: increment streak counter ──
+                streak_counters[cooldown_key] = streak_counters.get(cooldown_key, 0) + 1
+                current_streak = streak_counters[cooldown_key]
 
-                orig_frame = result.orig_img.copy()
+                # ── Part 1: only fire when streak reaches PERSISTENCE_FRAMES ──
+                # AND not in cooldown
+                if current_streak >= PERSISTENCE_FRAMES and cooldown_key not in active_violations:
+                    incident_count += 1
+                    incident_id     = f"inc_{incident_count:04d}"
+                    screenshot_path = f"incidents/{incident_id}.jpg"
 
-                if result.boxes is not None and len(result.boxes) > 0:
-                    for det_box, det_id in zip(
-                        result.boxes.xyxy.cpu().numpy(),
-                        result.boxes.id.cpu().numpy() if result.boxes.id is not None else [None] * len(result.boxes)
-                    ):
-                        bx1, by1, bx2, by2 = map(int, det_box)
-                        det_id_val = int(det_id) if det_id is not None else 0
-                        cv2.rectangle(orig_frame, (bx1, by1), (bx2, by2), (255, 100, 0), 2)
-                        label = f"id:{det_id_val} person"
-                        (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
-                        cv2.rectangle(orig_frame, (bx1, by1 - lh - 8), (bx1 + lw + 4, by1), (255, 100, 0), -1)
-                        cv2.putText(orig_frame, label, (bx1 + 2, by1 - 4),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+                    # ── Part 1: screenshot taken at frame N (when incident fires) ──
+                    orig_frame = result.orig_img.copy()
 
-                for zn, zd in zones_map.items():
-                    color = (0, 255, 255) if zn == zone_name else (0, 180, 180)
-                    pts = np.array(zd['poly'], dtype=np.int32).reshape((-1, 1, 2))
-                    cv2.polylines(orig_frame, [pts], isClosed=True, color=color, thickness=2)
-                    cv2.putText(orig_frame, zn.replace("_", " ").upper(),
-                                (int(zd['x_min']) + 4, int(zd['y_min']) + 18),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+                    if result.boxes is not None and len(result.boxes) > 0:
+                        for det_box, det_id in zip(
+                            result.boxes.xyxy.cpu().numpy(),
+                            result.boxes.id.cpu().numpy() if result.boxes.id is not None else [None] * len(result.boxes)
+                        ):
+                            bx1, by1, bx2, by2 = map(int, det_box)
+                            det_id_val = int(det_id) if det_id is not None else 0
+                            cv2.rectangle(orig_frame, (bx1, by1), (bx2, by2), (255, 100, 0), 2)
+                            label = f"id:{det_id_val} person"
+                            (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+                            cv2.rectangle(orig_frame, (bx1, by1 - lh - 8), (bx1 + lw + 4, by1), (255, 100, 0), -1)
+                            cv2.putText(orig_frame, label, (bx1 + 2, by1 - 4),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
-                cv2.imwrite(screenshot_path, orig_frame)
+                    for zn, zd in zones_map.items():
+                        color = (0, 255, 255) if zn == zone_name else (0, 180, 180)
+                        pts = np.array(zd['poly'], dtype=np.int32).reshape((-1, 1, 2))
+                        cv2.polylines(orig_frame, [pts], isClosed=True, color=color, thickness=2)
+                        cv2.putText(orig_frame, zn.replace("_", " ").upper(),
+                                    (int(zd['x_min']) + 4, int(zd['y_min']) + 18),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
-                incident = {
-                    "id":              incident_id,
-                    "timestamp":       datetime.now().isoformat(),
-                    "frame":           frame_idx,
-                    "camera":          video,
-                    "person_id":       person_id,
-                    "violation":       violation_type,
-                    "missing_gear":    missing_gear,
-                    "zone":            zone_name,
-                    "rule_index":      rule_idx,
-                    "bbox":            [float(x1), float(y1), float(x2), float(y2)],
-                    "screenshot_path": screenshot_path,
-                    "rule_type":       rule_type,
-                    "alert_message":   config['alert']['message']
-                }
+                    # ── Part 1: add streak info to screenshot ──
+                    label_text = f"VIOLATION CONFIRMED streak={current_streak}"
+                    cv2.putText(orig_frame,
+            label_text,
+            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
 
-                append_incident(incident)
+                    cv2.imwrite(screenshot_path, orig_frame)
 
-                print(f"Frame {frame_idx}: person #{person_id} | rule[{rule_idx}] {rule_type} in {zone_name}"
-                      + (f" | missing: {missing_gear}" if missing_gear else "")
-                      + f" → {incident_id} [SAVED]")
+                    incident = {
+                        "id":              incident_id,
+                        "timestamp":       datetime.now().isoformat(),
+                        "frame":           frame_idx,
+                        "camera":          video,
+                        "person_id":       person_id,
+                        "violation":       violation_type,
+                        "missing_gear":    missing_gear,
+                        "zone":            zone_name,
+                        "rule_index":      rule_idx,
+                        "bbox":            [float(x1), float(y1), float(x2), float(y2)],
+                        "screenshot_path": screenshot_path,
+                        "rule_type":       rule_type,
+                        "alert_message":   config['alert']['message'],
+                        "streak_frames":   current_streak,
+                    }
 
-            active_violations[cooldown_key] = frame_idx
+                    append_incident(incident)
+
+                    print(f"Frame {frame_idx}: person #{person_id} | rule[{rule_idx}] {rule_type} in {zone_name}"
+                          + (f" | missing: {missing_gear}" if missing_gear else "")
+                          + f" | streak={current_streak} → {incident_id} [FIRED]")
+
+                    active_violations[cooldown_key] = frame_idx
+
+            else:
+                # ── Part 1: reset streak if violation stops ──
+                if cooldown_key in streak_counters:
+                    del streak_counters[cooldown_key]
+                # cleanup stale cooldown
+                if cooldown_key in active_violations:
+                    if frame_idx - active_violations[cooldown_key] > 150:
+                        del active_violations[cooldown_key]
 
 # ============================================================
 # DONE
