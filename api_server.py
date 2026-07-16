@@ -21,7 +21,7 @@ import csv
 import io
 
 from db.session import get_db, SessionLocal
-from db.models import User, Rule, Incident, Camera as CameraModel, Site, Zone
+from db.models import User, Rule, Incident, Camera as CameraModel, Site, Zone, Setting
 from auth.password import hash_password, verify_password
 from auth.jwt_handler import create_token
 from auth.dependencies import get_current_user
@@ -69,12 +69,43 @@ def _parse_source(src):
 
 VIDEO_SOURCE_DEFAULT = _parse_source(os.getenv("VIDEO_SOURCE", "test_video.mp4"))
 
-_settings = {
-    "detection": {"alert_cooldown_frames": 150, "detection_confidence": 0.5, "bytetrack_buffer": 30},
+# ============================================================
+# SETTINGS — Task 3: DB-backed instead of in-memory dict
+# ============================================================
+
+DEFAULT_SETTINGS = {
+    "detection": {"alert_cooldown_frames": 150, "detection_confidence": 0.5, "bytetrack_buffer": 30, "persistence_frames": 5},
     "alerts": {"channels": "dashboard", "deduplication_enabled": True, "email_notifications_enabled": False},
     "ai_model": {"frame_sampling": "every", "model_precision": "balanced"},
     "platform": {"llm_model": "claude-haiku", "site_name": "Site A — Construction", "api_endpoint": PUBLIC_BASE_URL},
 }
+
+
+def get_settings_for_site(db: Session, site_id: int) -> dict:
+    """DB-backed settings, merged over defaults. Settings are stored one row per section (site-wide, not per-user)."""
+    settings = json.loads(json.dumps(DEFAULT_SETTINGS))  # deep copy
+    rows = db.query(Setting).filter(Setting.site_id == site_id, Setting.user_id.is_(None)).all()
+    for row in rows:
+        if row.key in settings and isinstance(row.value, dict):
+            settings[row.key].update(row.value)
+    return settings
+
+
+def save_settings_for_site(db: Session, site_id: int, updates: dict):
+    for section in ("detection", "alerts", "ai_model", "platform"):
+        if section not in updates:
+            continue
+        existing_row = db.query(Setting).filter(
+            Setting.site_id == site_id, Setting.key == section, Setting.user_id.is_(None)
+        ).first()
+        current = get_settings_for_site(db, site_id)[section]
+        current.update(updates[section])
+        if existing_row:
+            existing_row.value = current
+        else:
+            db.add(Setting(site_id=site_id, user_id=None, key=section, value=current))
+    db.commit()
+
 
 _pipeline_process = None
 
@@ -844,6 +875,13 @@ async def apply_rule(
         else:
             merged = new_config
         merged = enrich_zone_coords(merged, db, current_user.site_id)
+
+        # ── Task 3: inject site-wide settings into the pipeline config at apply time ──
+        site_settings = get_settings_for_site(db, current_user.site_id)
+        merged["persistence_frames"] = site_settings["detection"].get("persistence_frames", 5)
+        merged["alert_cooldown_frames"] = site_settings["detection"].get("alert_cooldown_frames", 150)
+        merged["detection_confidence"] = site_settings["detection"].get("detection_confidence", 0.5)
+
         with open(config_path, "w") as f:
             json.dump(merged, f, indent=2)
         if _pipeline_process is not None and _pipeline_process.poll() is None:
@@ -1151,23 +1189,25 @@ def update_camera(
 # ============================================================
 
 @app.get("/api/settings")
-def get_settings(current_user: User = Depends(get_current_user)):
-    return _settings
+def get_settings(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    return get_settings_for_site(db, current_user.site_id)
 
 
 # ── A: auth + admin added ──
 @app.put("/api/settings")
 async def update_settings(
     request: Request,
+    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Only admins can change settings")
     body = await request.json()
-    for section in ("detection", "alerts", "ai_model", "platform"):
-        if section in body:
-            _settings[section].update(body[section])
-    return {"status": "saved", "settings": _settings}
+    save_settings_for_site(db, current_user.site_id, body)
+    return {"status": "saved", "settings": get_settings_for_site(db, current_user.site_id)}
 
 
 # ============================================================
@@ -1339,7 +1379,8 @@ def export_incidents(
     from_dt, to_dt = get_date_range(from_date, to_date)
     incidents = get_incidents_in_range(db, current_user.site_id, from_dt, to_dt)
     incidents.sort(key=lambda x: x.timestamp or datetime.min, reverse=True)
-    site_name = _settings["platform"].get("site_name", "Site").replace(" ", "_").replace("—", "-")
+    site_settings = get_settings_for_site(db, current_user.site_id)
+    site_name = site_settings["platform"].get("site_name", "Site").replace(" ", "_").replace("—", "-")
     from_str = from_dt.strftime("%Y-%m-%d")
     to_str = to_dt.strftime("%Y-%m-%d")
     filename_base = f"omnix_report_{site_name}_{from_str}_to_{to_str}"
@@ -1377,7 +1418,7 @@ def export_incidents(
         cell_style = ParagraphStyle("Cell", parent=styles["Normal"], fontSize=8, textColor=colors.HexColor("#374151"), wordWrap="CJK")
         story = []
         story.append(Paragraph("OMNIX Safety Report", title_style))
-        site_display = _settings["platform"].get("site_name", "Site A")
+        site_display = site_settings["platform"].get("site_name", "Site A")
         story.append(Paragraph(f"{site_display} · {from_str} to {to_str}", subtitle_style))
         story.append(Paragraph(f"Generated for {current_user.name or current_user.email} on {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", subtitle_style))
         story.append(Spacer(1, 0.5*cm))

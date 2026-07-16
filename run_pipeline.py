@@ -22,12 +22,20 @@ with open('pipeline_config.json', 'r') as f:
 # ── Part 1: Read persistence_frames from config (default 5) ──
 PERSISTENCE_FRAMES = int(config.get('persistence_frames', 5))
 
+# ── Task 3: Read alert_cooldown_frames and detection_confidence from config
+# (previously hardcoded 150 and 0.5). Settings page → apply_rule() writes these
+# into pipeline_config.json; this is where the pipeline actually reads them. ──
+ALERT_COOLDOWN_FRAMES = int(config.get('alert_cooldown_frames', 150))
+GLOBAL_DETECTION_CONFIDENCE = float(config.get('detection_confidence', 0.5))
+
 print(f"\n{'='*60}")
 print(f"Pipeline: {config['pipeline_id']}")
 print(f"Description: {config['description']}")
 print(f"Zones: {len(config.get('zones', []))}")
 print(f"Rules: {len(config.get('rules', []))}")
 print(f"Persistence frames: {PERSISTENCE_FRAMES}")
+print(f"Alert cooldown frames: {ALERT_COOLDOWN_FRAMES}")
+print(f"Global detection confidence: {GLOBAL_DETECTION_CONFIDENCE}")
 print(f"{'='*60}\n")
 
 # ============================================================
@@ -79,8 +87,10 @@ with open('model_registry.json', 'r') as f:
 
 print(f"[INFO] Model registry loaded: {list(registry.keys())}")
 
-# ── Part 2: Helper to get per-model conf_threshold ──
-def get_model_conf(model_name: str, fallback: float = 0.5) -> float:
+# ── Part 2: Helper to get per-model conf_threshold.
+# ── Task 3: fallback now comes from GLOBAL_DETECTION_CONFIDENCE (Settings),
+# not a hardcoded 0.5, unless a model has its own conf_threshold in the registry. ──
+def get_model_conf(model_name: str, fallback: float = GLOBAL_DETECTION_CONFIDENCE) -> float:
     entry = registry.get(model_name, {})
     return float(entry.get('conf_threshold', entry.get('confidence', fallback)))
 
@@ -138,8 +148,9 @@ for model_name in needed_models:
 
 base_entry   = registry.get("person", {})
 base_model_path = base_entry.get("model", "yolov8n.pt")
-# ── Part 2: use conf_threshold for person model ──
-base_conf    = get_model_conf("person", fallback=0.5)
+# ── Part 2 / Task 3: use conf_threshold for person model, falling back to the
+# Settings-driven GLOBAL_DETECTION_CONFIDENCE instead of a hardcoded 0.5 ──
+base_conf    = get_model_conf("person", fallback=GLOBAL_DETECTION_CONFIDENCE)
 base_model   = YOLO(base_model_path)
 print(f"\n[OK] Loaded base YOLO for person detection (conf_threshold={base_conf})")
 print(f"[INFO] Total models loaded: {list(models.keys())}\n")
@@ -238,8 +249,9 @@ def check_required_gear(person_bbox, frame, required_gear, loaded_models):
             print(f"  [WARN] Required gear '{gear_name}' not loaded, skipping")
             continue
         entry = registry.get(gear_name, {})
-        # ── Part 2: use conf_threshold per gear model ──
-        conf = get_model_conf(gear_name, fallback=0.5)
+        # ── Part 2 / Task 3: use conf_threshold per gear model, falling back
+        # to Settings-driven GLOBAL_DETECTION_CONFIDENCE instead of hardcoded 0.5 ──
+        conf = get_model_conf(gear_name, fallback=GLOBAL_DETECTION_CONFIDENCE)
 
         if entry.get("type") == "coco_default":
             class_id = entry.get("class_id", 0)
@@ -367,9 +379,9 @@ try:
                     # ── Part 1: reset streak when person leaves zone ──
                     if cooldown_key in streak_counters:
                         del streak_counters[cooldown_key]
-                    # cleanup stale cooldown
+                    # cleanup stale cooldown — ── Task 3: uses ALERT_COOLDOWN_FRAMES from Settings ──
                     if cooldown_key in active_violations:
-                        if frame_idx - active_violations[cooldown_key] > 150:
+                        if frame_idx - active_violations[cooldown_key] > ALERT_COOLDOWN_FRAMES:
                             del active_violations[cooldown_key]
                     continue
 
@@ -467,9 +479,9 @@ try:
                     # ── Part 1: reset streak if violation stops ──
                     if cooldown_key in streak_counters:
                         del streak_counters[cooldown_key]
-                    # cleanup stale cooldown
+                    # cleanup stale cooldown — ── Task 3: uses ALERT_COOLDOWN_FRAMES from Settings ──
                     if cooldown_key in active_violations:
-                        if frame_idx - active_violations[cooldown_key] > 150:
+                        if frame_idx - active_violations[cooldown_key] > ALERT_COOLDOWN_FRAMES:
                             del active_violations[cooldown_key]
 
 except Exception as e:
