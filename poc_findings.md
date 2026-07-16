@@ -116,6 +116,22 @@ _(None confidently identified as failures in this pass — see recall note above
 
 ---
 
+This is the demo we show advisors and pilot customers.
+---
+
+# Gloves Model Audit
+
+**Task:** Confirm what classes the `gloves_model` actually detects, since earlier accuracy testing showed it producing `helmet` and `head` detections unexpectedly.
+
+**Method:** Loaded the model directly and inspected `model.names`:
+```python
+from ultralytics import YOLO
+m = YOLO('runs/detect/gloves_model/weights/best.pt')
+print(m.names)
+```
+
+**Result:**
 ## Summary — which model needs retraining next
 
 Ranked by verified precision/recall from this test round: **helmet (95.7%/95.7%)** performed strongest, **vest (0%/untestable)** was inconclusive only because `test_video.mp4` contained no actual vests to detect — not a confirmed model failure, but its one false positive (mistaking harness webbing for vest fabric) is a real, specific weakness worth investigating with proper vest footage. **Gloves (100% precision on confirmed detections, recall unmeasurable)** is the least conclusively tested — combined with its already-known 78.9% training mAP (the lowest of the three) and its unexpected multi-class behavior, **gloves is the clearest candidate for a dedicated retraining and proper re-test with vest-and-glove-specific footage**, ideally using full-resolution frame review rather than thumbnail sampling.
+
