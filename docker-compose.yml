@@ -1,4 +1,3 @@
-version: "3.9"
 services:
   postgres:
     image: postgres:16
@@ -11,6 +10,35 @@ services:
       - "5432:5432"
     volumes:
       - omnix_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U omnix"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: omnix-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://omnix:omnix_dev_password@postgres:5432/omnix
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+      VIDEO_SOURCE: ${VIDEO_SOURCE:-test_video.mp4}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+    ports:
+      - "8000:8000"
+    volumes:
+      - omnix_incidents:/app/incidents
+      - ./runs:/app/runs
+      - ./test_video.mp4:/app/test_video.mp4
+      - ./construction.mp4:/app/construction.mp4
+      - ./model_registry.json:/app/model_registry.json
 
 volumes:
   omnix_pg_data:
+  omnix_incidents:
