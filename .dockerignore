@@ -1,0 +1,45 @@
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Model weights and training data — bind-mounted at runtime instead, don't bake into image
+runs/
+*.pt
+
+# Video files — bind-mounted at runtime (test_video.mp4, construction.mp4 are mounted explicitly)
+*.mp4
+!test_video.mp4
+!construction.mp4
+
+# Leftover testing artifacts from earlier model-accuracy work
+frames_*/
+incidents/
+*.jpg
+*.jpeg
+*.png
+
+# Local dev / OS files
+.env
+.env.*
+.vscode/
+.idea/
+*.log
+Thumbs.db
+.DS_Store
+
+# Docker itself
+Dockerfile
+docker-compose.yml
+docker-compose
+
+# Misc large/unrelated files sitting in the repo root from earlier work
+mediamtx*/
+*.zip
