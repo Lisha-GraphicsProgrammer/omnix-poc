@@ -75,4 +75,17 @@ Verified end-to-end: pipeline runs → incidents written → API serves →
 React displays with real screenshots → click row → see actual evidence frame.
 
 This is the demo we show advisors and pilot customers.
+---
 
+# Gloves Model Audit
+
+**Task:** Confirm what classes the `gloves_model` actually detects, since earlier accuracy testing showed it producing `helmet` and `head` detections unexpectedly.
+
+**Method:** Loaded the model directly and inspected `model.names`:
+```python
+from ultralytics import YOLO
+m = YOLO('runs/detect/gloves_model/weights/best.pt')
+print(m.names)
+```
+
+**Result:**

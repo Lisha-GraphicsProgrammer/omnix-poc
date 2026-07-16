@@ -6,6 +6,13 @@
   "forklift": { "type": "custom", "weights": "runs/detect/forklift_model/weights/best.pt", "confidence": 0.65, "conf_threshold": 0.5 },
   "fire":     { "type": "custom", "weights": "runs/detect/fire_model/weights/best.pt", "confidence": 0.7, "conf_threshold": 0.6 },
   "smoke":    { "type": "custom", "weights": "runs/detect/smoke_model/weights/best.pt", "confidence": 0.7, "conf_threshold": 0.6 },
-  "gloves":   { "type": "custom", "weights": "runs/detect/gloves_model/weights/best.pt", "confidence": 0.7, "conf_threshold": 0.55 },
+  "gloves":   {
+    "type": "custom",
+    "weights": "runs/detect/gloves_model/weights/best.pt",
+    "confidence": 0.7,
+    "conf_threshold": 0.55,
+    "classes": {"0": "gloves", "1": "head", "2": "helmet"},
+    "note": "Multi-class model despite the name — also detects head/helmet, not gloves-only. Confirmed via model.names audit (see poc_findings.md)."
+  },
   "ladder":   { "type": "custom", "weights": "runs/detect/ladder_model/weights/best.pt", "confidence": 0.95, "conf_threshold": 0.55 }
 }
