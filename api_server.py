@@ -53,6 +53,10 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 
 ZONE_COLORS = ["#00D4FF", "#00E676", "#FFB300", "#7C3AED", "#FF4444", "#FF6B6B", "#818cf8", "#f472b6"]
 
+# ── RTSP Phase 2: reconnect tuning ──
+RECONNECT_INTERVAL_SECONDS = 5
+CONSECUTIVE_FAILURE_THRESHOLD = 10
+
 
 def _parse_source(src):
     if src is None:
@@ -76,7 +80,7 @@ _pipeline_process = None
 
 
 # ============================================================
-# VIDEO STREAMING — per-camera dict (RTSP Phase 1)
+# VIDEO STREAMING — per-camera dict (RTSP Phase 1) + reconnect (Phase 2)
 # ============================================================
 
 class VideoStream:
@@ -89,6 +93,8 @@ class VideoStream:
         self.width = 0
         self.height = 0
         self.source = None
+        self.is_live = False  # True for rtsp:// or webcam index; False for local files
+        self._consecutive_failures = 0
 
     def start(self, source):
         with self.lock:
@@ -100,10 +106,12 @@ class VideoStream:
                 self.running = False
                 return False
             self.source = str(source)
+            self.is_live = isinstance(source, int) or (isinstance(source, str) and source.startswith("rtsp://"))
             self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 25
             self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             self.running = True
+            self._consecutive_failures = 0
         return True
 
     def read(self):
@@ -112,10 +120,24 @@ class VideoStream:
                 return None
             ret, frame = self.cap.read()
             if not ret:
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ret, frame = self.cap.read()
+                if self.is_live:
+                    # Live source (RTSP/webcam): looping to frame 0 is meaningless here.
+                    # Track consecutive failures instead of retrying immediately.
+                    self._consecutive_failures += 1
+                    if self._consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD:
+                        print(f"[OMNIX] Stream dead after {self._consecutive_failures} consecutive failed reads: {self.source}")
+                        self.running = False
+                        if self.cap:
+                            self.cap.release()
+                            self.cap = None
+                    return None
+                else:
+                    # Local file: loop back to start (unchanged existing behavior)
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = self.cap.read()
             if ret:
                 self.current_frame = frame
+                self._consecutive_failures = 0
                 return frame
             return None
 
@@ -171,6 +193,35 @@ def restart_stream(camera_id: int, db: Session):
     return get_or_start_stream(camera_id, db)
 
 
+def _reconnect_monitor():
+    """Background loop: checks for dead streams every RECONNECT_INTERVAL_SECONDS
+    and attempts to reconnect them, updating each camera's DB status along the way."""
+    while True:
+        time.sleep(RECONNECT_INTERVAL_SECONDS)
+        db = SessionLocal()
+        try:
+            with _video_streams_lock:
+                dead_camera_ids = [cid for cid, vs in video_streams.items() if not vs.running]
+            for cid in dead_camera_ids:
+                cam = db.query(CameraModel).filter(CameraModel.id == cid).first()
+                if cam:
+                    cam.status = "offline"
+                    db.commit()
+                print(f"[OMNIX] Attempting reconnect for camera {cid}...")
+                vs = get_or_start_stream(cid, db)
+                if vs:
+                    print(f"[OMNIX] Camera {cid} reconnected successfully")
+                    if cam:
+                        cam.status = "online"
+                        db.commit()
+                else:
+                    print(f"[OMNIX] Camera {cid} reconnect failed, retrying in {RECONNECT_INTERVAL_SECONDS}s")
+        except Exception as e:
+            print(f"[OMNIX] Reconnect monitor error: {e}")
+        finally:
+            db.close()
+
+
 @app.on_event("startup")
 def on_startup():
     seed()
@@ -178,9 +229,13 @@ def on_startup():
     try:
         for cam in db.query(CameraModel).all():
             vs = get_or_start_stream(cam.id, db)
+            cam.status = "online" if vs else "offline"
             print(f"[OMNIX] Camera {cam.id} ({cam.name}): {'started' if vs else 'offline'} — source={cam.source}")
+        db.commit()
     finally:
         db.close()
+    threading.Thread(target=_reconnect_monitor, daemon=True).start()
+    print(f"[OMNIX] Reconnect monitor started (checks every {RECONNECT_INTERVAL_SECONDS}s)")
 
 
 # ============================================================
