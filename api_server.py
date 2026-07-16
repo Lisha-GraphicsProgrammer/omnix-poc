@@ -20,7 +20,7 @@ from collections import defaultdict
 import csv
 import io
 
-from db.session import get_db
+from db.session import get_db, SessionLocal
 from db.models import User, Rule, Incident, Camera as CameraModel, Site, Zone
 from auth.password import hash_password, verify_password
 from auth.jwt_handler import create_token
@@ -75,9 +75,112 @@ _settings = {
 _pipeline_process = None
 
 
+# ============================================================
+# VIDEO STREAMING — per-camera dict (RTSP Phase 1)
+# ============================================================
+
+class VideoStream:
+    def __init__(self):
+        self.cap = None
+        self.lock = threading.Lock()
+        self.running = False
+        self.current_frame = None
+        self.fps = 0
+        self.width = 0
+        self.height = 0
+        self.source = None
+
+    def start(self, source):
+        with self.lock:
+            if self.cap:
+                self.cap.release()
+            self.cap = cv2.VideoCapture(source)
+            if not self.cap.isOpened():
+                self.cap = None
+                self.running = False
+                return False
+            self.source = str(source)
+            self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 25
+            self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.running = True
+        return True
+
+    def read(self):
+        with self.lock:
+            if not self.cap or not self.running:
+                return None
+            ret, frame = self.cap.read()
+            if not ret:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = self.cap.read()
+            if ret:
+                self.current_frame = frame
+                return frame
+            return None
+
+    def stop(self):
+        with self.lock:
+            self.running = False
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+
+
+# camera_id -> VideoStream. Replaces the old single global `video_stream`.
+video_streams: dict[int, VideoStream] = {}
+_video_streams_lock = threading.Lock()
+
+
+def _camera_source_for(camera_id: int, db: Session):
+    """
+    Resolve the actual source to open for a camera.
+    DB source wins. Camera 1 falls back to VIDEO_SOURCE_DEFAULT (.env) if the
+    DB source is unset/placeholder, so existing dev setups keep working unchanged.
+    """
+    cam = db.query(CameraModel).filter(CameraModel.id == camera_id).first()
+    if cam and cam.source and cam.source != "default":
+        return _parse_source(cam.source)
+    if camera_id == 1:
+        return VIDEO_SOURCE_DEFAULT
+    return None
+
+
+def get_or_start_stream(camera_id: int, db: Session):
+    """Returns a running VideoStream for camera_id, starting one if needed. None if source can't be resolved/opened."""
+    with _video_streams_lock:
+        vs = video_streams.get(camera_id)
+        if vs is not None and vs.running:
+            return vs
+        source = _camera_source_for(camera_id, db)
+        if source is None:
+            return None
+        vs = VideoStream()
+        if not vs.start(source):
+            return None
+        video_streams[camera_id] = vs
+        return vs
+
+
+def restart_stream(camera_id: int, db: Session):
+    """Force-stop and reopen a camera's stream (used after its source changes)."""
+    with _video_streams_lock:
+        old = video_streams.pop(camera_id, None)
+        if old:
+            old.stop()
+    return get_or_start_stream(camera_id, db)
+
+
 @app.on_event("startup")
 def on_startup():
     seed()
+    db = SessionLocal()
+    try:
+        for cam in db.query(CameraModel).all():
+            vs = get_or_start_stream(cam.id, db)
+            print(f"[OMNIX] Camera {cam.id} ({cam.name}): {'started' if vs else 'offline'} — source={cam.source}")
+    finally:
+        db.close()
 
 
 # ============================================================
@@ -377,6 +480,7 @@ def get_incidents(
                     "missing_gear": inc.missing_gear,
                     "reviewed": inc.reviewed,
                     "review_status": inc.review_status,
+                    "camera_id": inc.camera_id,
                 }
                 if inc.screenshot_path:
                     filename = inc.screenshot_path.replace("incidents/", "")
@@ -656,6 +760,8 @@ async def apply_rule(
         new_config = body.get("config")
         instruction = body.get("instruction", "")
         force_overwrite = body.get("overwrite", False)
+        # ── RTSP Phase 1: which camera this rule/pipeline run applies to ──
+        camera_id = int(body.get("camera_id") or 1)
         if not new_config:
             raise HTTPException(status_code=400, detail="config is required")
         if current_user.role != "admin":
@@ -697,8 +803,9 @@ async def apply_rule(
         for f in Path("incidents").glob("*.jpg"):
             try: f.unlink()
             except: pass
+        # ── RTSP Phase 1: pass the real camera_id through to run_pipeline.py ──
         _pipeline_process = subprocess.Popen(
-            [sys.executable, "run_pipeline.py"],
+            [sys.executable, "run_pipeline.py", "--camera_id", str(camera_id)],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
         return {
@@ -709,6 +816,7 @@ async def apply_rule(
             "total_zones": len(merged["zones"]),
             "total_rules": len(merged["rules"]),
             "pipeline_pid": _pipeline_process.pid,
+            "camera_id": camera_id,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -759,78 +867,16 @@ def stop_pipeline(current_user: User = Depends(get_current_user)):
 
 
 # ============================================================
-# VIDEO STREAMING
+# VIDEO STREAMING — endpoints (per-camera)
 # ============================================================
 
-class VideoStream:
-    def __init__(self):
-        self.cap = None
-        self.lock = threading.Lock()
-        self.running = False
-        self.current_frame = None
-        self.fps = 0
-        self.width = 0
-        self.height = 0
-        self.source = None
-
-    def start(self, source):
-        with self.lock:
-            if self.cap:
-                self.cap.release()
-            self.cap = cv2.VideoCapture(source)
-            if not self.cap.isOpened():
-                self.cap = None
-                self.running = False
-                return False
-            self.source = str(source)
-            self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 25
-            self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            self.running = True
-        return True
-
-    def read(self):
-        with self.lock:
-            if not self.cap or not self.running:
-                return None
-            ret, frame = self.cap.read()
-            if not ret:
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ret, frame = self.cap.read()
-            if ret:
-                self.current_frame = frame
-                return frame
-            return None
-
-    def stop(self):
-        with self.lock:
-            self.running = False
-            if self.cap:
-                self.cap.release()
-                self.cap = None
-
-
-video_stream = VideoStream()
-
-source_ok = (
-    isinstance(VIDEO_SOURCE_DEFAULT, int)
-    or (isinstance(VIDEO_SOURCE_DEFAULT, str) and VIDEO_SOURCE_DEFAULT.startswith("rtsp://"))
-    or Path(VIDEO_SOURCE_DEFAULT).exists()
-)
-if source_ok:
-    started = video_stream.start(VIDEO_SOURCE_DEFAULT)
-    label = f"webcam #{VIDEO_SOURCE_DEFAULT}" if isinstance(VIDEO_SOURCE_DEFAULT, int) else VIDEO_SOURCE_DEFAULT
-    print(f"[OMNIX] Video stream auto-started: {label} ({'OK' if started else 'FAILED'})")
-else:
-    print(f"[OMNIX] Video source not found: {VIDEO_SOURCE_DEFAULT}. Camera 1 will be offline.")
-
-
-def generate_frames():
+def generate_frames(camera_id: int):
     target_fps = 25
     frame_interval = 1.0 / target_fps
     while True:
         start = time.time()
-        frame = video_stream.read()
+        vs = video_streams.get(camera_id)
+        frame = vs.read() if vs else None
         if frame is None:
             placeholder = np.zeros((480, 854, 3), dtype=np.uint8)
             cv2.putText(placeholder, "NO SIGNAL", (320, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (80, 80, 80), 2)
@@ -858,14 +904,16 @@ def generate_placeholder_frames():
 
 
 @app.get("/api/video/stream")
-def video_stream_endpoint(camera_id: int = 1):
-    gen = generate_frames() if camera_id == 1 else generate_placeholder_frames()
+def video_stream_endpoint(camera_id: int = 1, db: Session = Depends(get_db)):
+    vs = get_or_start_stream(camera_id, db)
+    gen = generate_frames(camera_id) if vs else generate_placeholder_frames()
     return StreamingResponse(gen, media_type="multipart/x-mixed-replace;boundary=frame")
 
 
 @app.get("/api/video/snapshot")
-def video_snapshot(camera_id: int = 1):
-    frame = video_stream.read() if camera_id == 1 else None
+def video_snapshot(camera_id: int = 1, db: Session = Depends(get_db)):
+    vs = get_or_start_stream(camera_id, db)
+    frame = vs.read() if vs else None
     if frame is None:
         placeholder = np.zeros((480, 854, 3), dtype=np.uint8)
         cv2.putText(placeholder, "NO SIGNAL", (320, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (80, 80, 80), 2)
@@ -878,16 +926,18 @@ def video_snapshot(camera_id: int = 1):
     return Response(content=buffer.tobytes(), media_type="image/jpeg")
 
 
-# ── A: auth + admin added ──
+# ── A: auth + admin added. Now per-camera; camera_id defaults to 1 for back-compat ──
 @app.post("/api/video/source")
 async def set_video_source(
     request: Request,
+    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Only admins can change video source")
     body = await request.json()
     raw_source = body.get("source", "")
+    camera_id = int(body.get("camera_id") or 1)
     if isinstance(raw_source, str):
         raw_source = raw_source.strip()
     if raw_source == "" or raw_source is None:
@@ -895,45 +945,150 @@ async def set_video_source(
     source = _parse_source(raw_source)
     if isinstance(source, str) and not source.startswith("rtsp://") and not Path(source).exists():
         raise HTTPException(status_code=404, detail=f"File not found: {source}")
-    success = video_stream.start(source)
+    with _video_streams_lock:
+        vs = video_streams.get(camera_id) or VideoStream()
+        success = vs.start(source)
+        if success:
+            video_streams[camera_id] = vs
     if not success:
         raise HTTPException(status_code=500, detail="Failed to open video source")
-    return {"status": "ok", "source": str(source), "fps": video_stream.fps}
+    return {"status": "ok", "source": str(source), "fps": vs.fps, "camera_id": camera_id}
 
 
 # ============================================================
-# CAMERAS — reads from DB
+# CAMERAS — reads from DB, per-camera live status
 # ============================================================
 
-# ── A: auth added, C1: reads from DB ──
+class CameraCreateRequest(BaseModel):
+    name: str
+    location: str = ""
+    source: str
+
+
+class CameraUpdateRequest(BaseModel):
+    name: str | None = None
+    location: str | None = None
+    source: str | None = None
+
+
+def _validate_source(source: str) -> str:
+    source = (source or "").strip()
+    if not source:
+        raise HTTPException(status_code=400, detail="source is required")
+    if source.startswith("rtsp://"):
+        return source
+    if source.isdigit():
+        return source  # webcam index — validated on actual open attempt
+    if not Path(source).exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {source}")
+    return source
+
+
+# ── A: auth added, C1: reads from DB, now per-camera live status ──
 @app.get("/api/cameras")
 def get_cameras(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    video_ok = video_stream.running and video_stream.cap is not None
-    stream_url   = f"{PUBLIC_BASE_URL}/api/video/stream"   if video_ok else None
-    snapshot_url = f"{PUBLIC_BASE_URL}/api/video/snapshot" if video_ok else None
-
     cameras = db.query(CameraModel).filter(
         CameraModel.site_id == current_user.site_id
     ).order_by(CameraModel.id).all()
 
     result = []
     for cam in cameras:
-        is_live = cam.id == 1 and video_ok
+        vs = video_streams.get(cam.id)
+        is_live = vs is not None and vs.running and vs.cap is not None
         result.append({
             "id": cam.id,
             "name": cam.name,
             "location": cam.location,
             "status": "online" if is_live else cam.status,
-            "stream_url":   stream_url   if is_live else None,
-            "snapshot_url": snapshot_url if is_live else None,
-            "fps":        int(video_stream.fps) if is_live else 0,
-            "resolution": f"{video_stream.width}x{video_stream.height}" if is_live else "N/A",
-            "source": video_stream.source if is_live else cam.source,
+            "stream_url":   f"{PUBLIC_BASE_URL}/api/video/stream?camera_id={cam.id}"   if is_live else None,
+            "snapshot_url": f"{PUBLIC_BASE_URL}/api/video/snapshot?camera_id={cam.id}" if is_live else None,
+            "fps":        int(vs.fps) if is_live else 0,
+            "resolution": f"{vs.width}x{vs.height}" if is_live else "N/A",
+            "source": vs.source if is_live else cam.source,
         })
     return result
+
+
+@app.post("/api/cameras")
+def create_camera(
+    body: CameraCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can add cameras")
+    validated_source = _validate_source(body.source)
+    cam = CameraModel(
+        site_id=current_user.site_id,
+        name=(body.name or "").strip() or "Unnamed Camera",
+        location=(body.location or "").strip(),
+        source=validated_source,
+        status="offline",
+    )
+    db.add(cam)
+    db.commit()
+    db.refresh(cam)
+
+    vs = get_or_start_stream(cam.id, db)
+    cam.status = "online" if vs else "offline"
+    if vs:
+        cam.fps = int(vs.fps)
+        cam.resolution = f"{vs.width}x{vs.height}"
+    db.commit()
+    db.refresh(cam)
+
+    return {
+        "id": cam.id, "name": cam.name, "location": cam.location,
+        "source": cam.source, "status": cam.status,
+        "fps": cam.fps, "resolution": cam.resolution,
+    }
+
+
+@app.put("/api/cameras/{camera_id}")
+def update_camera(
+    camera_id: int,
+    body: CameraUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can edit cameras")
+    cam = db.query(CameraModel).filter(
+        CameraModel.id == camera_id,
+        CameraModel.site_id == current_user.site_id
+    ).first()
+    if not cam:
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    if body.name is not None:
+        cam.name = body.name.strip()
+    if body.location is not None:
+        cam.location = body.location.strip()
+
+    source_changed = False
+    if body.source is not None:
+        cam.source = _validate_source(body.source)
+        source_changed = True
+
+    db.commit()
+
+    if source_changed:
+        vs = restart_stream(camera_id, db)
+        cam.status = "online" if vs else "offline"
+        if vs:
+            cam.fps = int(vs.fps)
+            cam.resolution = f"{vs.width}x{vs.height}"
+        db.commit()
+        db.refresh(cam)
+
+    return {
+        "id": cam.id, "name": cam.name, "location": cam.location,
+        "source": cam.source, "status": cam.status,
+        "fps": cam.fps, "resolution": cam.resolution,
+    }
 
 
 # ============================================================
@@ -1143,7 +1298,7 @@ def export_incidents(
             if inc.screenshot_path:
                 filename = inc.screenshot_path.replace("incidents/", "")
                 screenshot_url = f"{PUBLIC_BASE_URL}/screenshots/{filename}"
-            writer.writerow([inc.id, inc.timestamp.isoformat() if inc.timestamp else "", inc.violation_type or "", inc.severity or "", inc.zone or "", "Camera 1", inc.alert_message or "", inc.review_status or "", inc.reviewed_by or "", screenshot_url])
+            writer.writerow([inc.id, inc.timestamp.isoformat() if inc.timestamp else "", inc.violation_type or "", inc.severity or "", inc.zone or "", f"Camera {inc.camera_id or 1}", inc.alert_message or "", inc.review_status or "", inc.reviewed_by or "", screenshot_url])
         output.seek(0)
         return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{filename_base}.csv"'})
 
@@ -1200,7 +1355,7 @@ def export_incidents(
         col_widths = [page_w*0.05, page_w*0.13, page_w*0.18, page_w*0.08, page_w*0.13, page_w*0.10, page_w*0.23, page_w*0.10]
         table_data = [["ID", "Timestamp", "Rule", "Severity", "Zone", "Camera", "Message", "Status"]]
         for inc in incidents[:500]:
-            table_data.append([str(inc.id), inc.timestamp.strftime("%Y-%m-%d %H:%M") if inc.timestamp else "", Paragraph((inc.violation_type or "").replace("_", " ").title(), cell_style), (inc.severity or "").capitalize(), Paragraph((inc.zone or "").replace("_", " ").title(), cell_style), "Camera 1", Paragraph(inc.alert_message or "", cell_style), (inc.review_status or "pending").capitalize()])
+            table_data.append([str(inc.id), inc.timestamp.strftime("%Y-%m-%d %H:%M") if inc.timestamp else "", Paragraph((inc.violation_type or "").replace("_", " ").title(), cell_style), (inc.severity or "").capitalize(), Paragraph((inc.zone or "").replace("_", " ").title(), cell_style), f"Camera {inc.camera_id or 1}", Paragraph(inc.alert_message or "", cell_style), (inc.review_status or "pending").capitalize()])
         inc_table = Table(table_data, colWidths=col_widths, repeatRows=1)
         inc_table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor("#1e1b4b")), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"), ("FONTSIZE", (0,0), (-1,0), 9), ("ALIGN", (0,0), (-1,-1), "LEFT"), ("VALIGN", (0,0), (-1,-1), "MIDDLE"), ("FONTSIZE", (0,1), (-1,-1), 8), ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.HexColor("#f9fafb"), colors.white]), ("GRID", (0,0), (-1,-1), 0.3, colors.HexColor("#e5e7eb")), ("LEFTPADDING", (0,0), (-1,-1), 5), ("RIGHTPADDING", (0,0), (-1,-1), 5), ("TOPPADDING", (0,0), (-1,-1), 4), ("BOTTOMPADDING", (0,0), (-1,-1), 4)]))
         story.append(inc_table)

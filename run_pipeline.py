@@ -33,29 +33,43 @@ print(f"{'='*60}\n")
 # ============================================================
 # LOAD DB REFERENCES
 # ============================================================
-def get_db_refs():
+import argparse
+
+_arg_parser = argparse.ArgumentParser()
+_arg_parser.add_argument("--camera_id", type=int, default=1)
+_args, _ = _arg_parser.parse_known_args()
+TARGET_CAMERA_ID = _args.camera_id
+
+
+def get_db_refs(target_camera_id: int):
     try:
         db = SessionLocal()
         site = db.query(Site).first()
-        camera = db.query(CameraModel).first()
+        camera = db.query(CameraModel).filter(CameraModel.id == target_camera_id).first()
+        if camera is None:
+            print(f"[WARN] camera_id={target_camera_id} not found in DB, falling back to first camera row")
+            camera = db.query(CameraModel).first()
         rule = db.query(Rule).filter(
             Rule.pipeline_id == config['pipeline_id'],
             Rule.status == 'active'
         ).first()
         if not rule:
             rule = db.query(Rule).filter(Rule.status == 'active').first()
+        source = camera.source if (camera and camera.source and camera.source != "default") else None
+        resolved_camera_id = camera.id if camera else None
         db.close()
         return (
             site.id if site else None,
-            camera.id if camera else None,
+            resolved_camera_id,
             rule.id if rule else None,
+            source,
         )
     except Exception as e:
         print(f"[WARN] Could not get DB refs: {e}")
-        return None, None, None
+        return None, None, None, None
 
-site_id, camera_id, rule_id = get_db_refs()
-print(f"[DB] site_id={site_id}, camera_id={camera_id}, rule_id={rule_id}")
+site_id, camera_id, rule_id, camera_source = get_db_refs(TARGET_CAMERA_ID)
+print(f"[DB] site_id={site_id}, camera_id={camera_id}, rule_id={rule_id}, camera_source={camera_source}")
 
 # ============================================================
 # MODEL REGISTRY — load registry and lazy-load only needed models
@@ -284,8 +298,8 @@ active_violations = {}
 # streak_counters[key] = number of consecutive frames with violation
 streak_counters = {}
 
-video = 'test_video.mp4'
-print(f"Processing {video}...")
+video = camera_source if camera_source else 'test_video.mp4'
+print(f"Processing {video} (camera_id={camera_id})...")
 
 _cap = cv2.VideoCapture(video)
 ORIG_W = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
