@@ -30,14 +30,13 @@ def seed():
                 site_id=site.id,
             )
 
-               cam = Camera(
+            cam = Camera(
                 site_id=site.id,
                 name="Camera 1 — Loading Zone",
                 location="Loading zone entrance",
                 source="mega_cctv.mp4",
                 status="online",
             )
-
             db.add_all([admin, cam])
             db.commit()
             print("[OMNIX] Seed complete — admin user and Camera 1 created.")
