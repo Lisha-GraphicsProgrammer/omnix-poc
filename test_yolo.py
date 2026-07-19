@@ -3,7 +3,7 @@ from ultralytics import YOLO
 model = YOLO('yolov8n.pt')
 
 results = model(
-    source='test_video.mp4',
+    source='mega_cctv.mp4',
     classes=[0, 2, 3, 7],
     conf=0.5,
     save=True,

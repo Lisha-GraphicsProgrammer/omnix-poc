@@ -65,9 +65,9 @@ def run_from_json(json_file, video_path):
     print(f"RESULT: {'WORKS' if not missing else 'PARTIAL - missing ' + str(missing)}")
 
 # Run all 3
-run_from_json("instruction_1_helmet.json", "test_video.mp4")
-run_from_json("instruction_2_vehicle.json", "test_video.mp4")
-run_from_json("instruction_3_count.json", "test_video.mp4")
+run_from_json("instruction_1_helmet.json", "mega_cctv.mp4")
+run_from_json("instruction_2_vehicle.json", "mega_cctv.mp4")
+run_from_json("instruction_3_count.json", "mega_cctv.mp4")
 
 print("\n" + "="*50)
 print("ALL TESTS COMPLETE")

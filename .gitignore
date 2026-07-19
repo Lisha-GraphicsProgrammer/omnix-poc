@@ -20,6 +20,7 @@ Forklift-2/
 
 # Videos (test assets stay local)
 *.mp4
+!mega_cctv.mp4
 
 # Model weights & training runs (new ones; existing tracked files unaffected)
 runs/detect/*/weights/last.pt
@@ -31,3 +32,10 @@ incidents/
 incidents.json
 pipeline_config.json
 pipeline_config.backup.json
+
+# Training run debris
+runs/detect/predict*/
+runs/detect/*/args.yaml
+runs/detect/*/results.csv
+test_summary.json
+test_frame_*.jpg
