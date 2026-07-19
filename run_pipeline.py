@@ -134,6 +134,9 @@ needed_models = set()
 for rule in config.get('rules', []):
     for gear in rule.get('required', []):
         needed_models.add(gear)
+    # ── object_in_zone: the target object model must be loaded too ──
+    if rule.get('target'):
+        needed_models.add(rule['target'])
 for name in config.get('models', {}).keys():
     needed_models.add(name)
 
@@ -165,7 +168,7 @@ def append_incident(incident: dict):
         try:
             db = SessionLocal()
             db_incident = Incident(
-                rule_id=rule_id,
+                 rule_id=incident.get("rule_db_id") or rule_id,
                 camera_id=camera_id,
                 site_id=site_id,
                 timestamp=datetime.fromisoformat(incident["timestamp"]),
@@ -353,6 +356,91 @@ results = base_model.track(
 # instead of silently exiting. Loop body itself is unchanged. ──
 try:
     for frame_idx, result in enumerate(results):
+
+        # ============================================================
+        # ── object_in_zone rules: evaluated PER FRAME, independent of
+        # people. "Alert when fire is detected in site area" fires on
+        # the fire itself — no person required. ──
+        # ============================================================
+        for rule_idx, rule in enumerate(rules):
+            if rule.get('type') != 'object_in_zone':
+                continue
+            target = rule.get('target') or (rule.get('required') or [None])[0]
+            zone_name = rule.get('zone', '')
+            if not target or target not in models or zone_name not in zones_map:
+                continue
+            zone = zones_map[zone_name]
+            obj_key = ('obj', rule_idx)
+
+            conf = get_model_conf(target, fallback=GLOBAL_DETECTION_CONFIDENCE)
+            entry = registry.get(target, {})
+            if entry.get("type") == "coco_default":
+                obj_results = models[target](result.orig_img, verbose=False,
+                                             conf=conf, classes=[entry.get("class_id", 0)])
+            else:
+                obj_results = models[target](result.orig_img, verbose=False, conf=conf)
+
+            hits = []
+            if obj_results[0].boxes is not None and len(obj_results[0].boxes) > 0:
+                for ob in obj_results[0].boxes.xyxy.cpu().numpy():
+                    ocx = (ob[0] + ob[2]) / 2
+                    ocy = (ob[1] + ob[3]) / 2
+                    if point_in_polygon(ocx, ocy, zone['poly']):
+                        hits.append(ob)
+
+            if hits:
+                streak_counters[obj_key] = streak_counters.get(obj_key, 0) + 1
+                current_streak = streak_counters[obj_key]
+                if current_streak >= PERSISTENCE_FRAMES and obj_key not in active_violations:
+                    incident_count += 1
+                    incident_id = f"inc_{incident_count:04d}"
+                    screenshot_path = f"incidents/{incident_id}.jpg"
+                    orig_frame = result.orig_img.copy()
+                    for ob in hits:
+                        bx1, by1, bx2, by2 = map(int, ob)
+                        cv2.rectangle(orig_frame, (bx1, by1), (bx2, by2), (0, 0, 255), 2)
+                        cv2.putText(orig_frame, target.upper(), (bx1 + 2, max(by1 - 6, 14)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    for zn, zd in zones_map.items():
+                        color = (0, 255, 255) if zn == zone_name else (0, 180, 180)
+                        pts = np.array(zd['poly'], dtype=np.int32).reshape((-1, 1, 2))
+                        cv2.polylines(orig_frame, [pts], isClosed=True, color=color, thickness=2)
+                        cv2.putText(orig_frame, zn.replace("_", " ").upper(),
+                                    (int(zd['x_min']) + 4, int(zd['y_min']) + 18),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+                    cv2.putText(orig_frame, f"{target.upper()} DETECTED streak={current_streak}",
+                                (10, orig_frame.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+                    cv2.imwrite(screenshot_path, orig_frame)
+
+                    fb = hits[0]
+                    incident = {
+                        "id":              incident_id,
+                        "timestamp":       datetime.now().isoformat(),
+                        "frame":           frame_idx,
+                        "camera":          video,
+                        "person_id":       None,
+                        "violation":       f"{target}_detected",
+                        "missing_gear":    [],
+                        "zone":            zone_name,
+                        "rule_index":      rule_idx,
+                        "bbox":            [float(fb[0]), float(fb[1]), float(fb[2]), float(fb[3])],
+                        "screenshot_path": screenshot_path,
+                        "rule_type":       "object_in_zone",
+                        "alert_message":   config['alert']['message'],
+                        "streak_frames":   current_streak,
+                        "rule_db_id":      rule.get("rule_db_id"),
+                    }
+                    append_incident(incident)
+                    print(f"Frame {frame_idx}: {target.upper()} | rule[{rule_idx}] object_in_zone in {zone_name}"
+                          + f" | streak={current_streak} → {incident_id} [FIRED]")
+                    active_violations[obj_key] = frame_idx
+            else:
+                if obj_key in streak_counters:
+                    del streak_counters[obj_key]
+                if obj_key in active_violations:
+                    if frame_idx - active_violations[obj_key] > ALERT_COOLDOWN_FRAMES:
+                        del active_violations[obj_key]
+
         if result.boxes is None or result.boxes.id is None:
             continue
 
@@ -369,6 +457,8 @@ try:
 
                 zone          = zones_map[zone_name]
                 rule_type     = rule.get('type', '')
+                if rule_type == 'object_in_zone':
+                    continue  # handled per-frame above, not per-person
                 required_gear = rule.get('required', [])
 
                 in_zone = point_in_polygon(person_center_x, person_bottom_y, zone['poly'])
@@ -446,7 +536,7 @@ try:
                         label_text = f"VIOLATION CONFIRMED streak={current_streak}"
                         cv2.putText(orig_frame,
                 label_text,
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+                (10, orig_frame.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
 
                         cv2.imwrite(screenshot_path, orig_frame)
 
@@ -465,6 +555,7 @@ try:
                             "rule_type":       rule_type,
                             "alert_message":   config['alert']['message'],
                             "streak_frames":   current_streak,
+                            "rule_db_id":      rule.get("rule_db_id"),
                         }
 
                         append_incident(incident)
