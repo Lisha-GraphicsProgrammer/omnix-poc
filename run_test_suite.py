@@ -22,7 +22,7 @@ from ultralytics import YOLO
 # VIDEOS TO TEST
 # ============================================================
 TEST_VIDEOS = [
-    "test_video.mp4",
+    "mega_cctv.mp4",
     "gloves.mp4",
     "forklift_person_helmet_gloves.mp4",
     "fire_smoke.mp4",

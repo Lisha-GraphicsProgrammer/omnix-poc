@@ -313,7 +313,7 @@ active_violations = {}
 # streak_counters[key] = number of consecutive frames with violation
 streak_counters = {}
 
-video = camera_source if camera_source else 'test_video.mp4'
+video = camera_source if camera_source else 'mega_cctv.mp4'
 print(f"Processing {video} (camera_id={camera_id})...")
 
 # ── RTSP Phase 2: know whether this is a live stream (rtsp://) vs a finite file ──

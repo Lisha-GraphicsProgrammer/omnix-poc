@@ -61,14 +61,14 @@ CONSECUTIVE_FAILURE_THRESHOLD = 10
 
 def _parse_source(src):
     if src is None:
-        return "test_video.mp4"
+        return "mega_cctv.mp4"
     try:
         return int(src)
     except (ValueError, TypeError):
         return str(src)
 
 
-VIDEO_SOURCE_DEFAULT = _parse_source(os.getenv("VIDEO_SOURCE", "test_video.mp4"))
+VIDEO_SOURCE_DEFAULT = _parse_source(os.getenv("VIDEO_SOURCE", "mega_cctv.mp4"))
 
 # ============================================================
 # SETTINGS — Task 3: DB-backed instead of in-memory dict
