@@ -26,6 +26,7 @@ from auth.password import hash_password, verify_password
 from auth.jwt_handler import create_token
 from auth.dependencies import get_current_user
 from db.seed import seed
+from sqlalchemy import func
 
 load_dotenv()
 
@@ -537,6 +538,13 @@ def root():
 def get_incidents(
     limit: int = 50,
     offset: int = 0,
+    rule_id: int = None,
+    camera_id: int = None,
+    violation: str = None,
+    severity: str = None,
+    review: str = None,          # "unreviewed" | "reviewed" | "false_positive" | "dismissed"
+    date_from: str = None,       # ISO date e.g. 2026-07-19
+    date_to: str = None,         # ISO date (inclusive)
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -544,16 +552,48 @@ def get_incidents(
     offset = max(0, offset)
     try:
         base_q = db.query(Incident).filter(Incident.site_id == current_user.site_id)
+        # ── Alert usability: server-side filters ──
+        if rule_id is not None:
+            base_q = base_q.filter(Incident.rule_id == rule_id)
+        if camera_id is not None:
+            base_q = base_q.filter(Incident.camera_id == camera_id)
+        if violation:
+            base_q = base_q.filter(Incident.violation_type == violation)
+        if severity:
+            base_q = base_q.filter(Incident.severity == severity.lower())
+        if review == "unreviewed":
+            base_q = base_q.filter(Incident.reviewed.isnot(True))
+        elif review in ("reviewed", "false_positive", "dismissed"):
+            base_q = base_q.filter(Incident.review_status == review)
+        if date_from:
+            try:
+                base_q = base_q.filter(Incident.timestamp >= datetime.fromisoformat(date_from))
+            except ValueError:
+                pass
+        if date_to:
+            try:
+                end = datetime.fromisoformat(date_to) + timedelta(days=1)
+                base_q = base_q.filter(Incident.timestamp < end)
+            except ValueError:
+                pass
         total = base_q.count()
-        if total > 0:
+        if total >= 0:
             incidents = (
                 base_q.order_by(Incident.timestamp.desc())
                 .offset(offset).limit(limit).all()
             )
+            # ── Alert usability: attach the plain-English rule that fired ──
+            rule_ids = {inc.rule_id for inc in incidents if inc.rule_id}
+            rule_map = {}
+            if rule_ids:
+                for r in db.query(Rule).filter(Rule.id.in_(rule_ids)).all():
+                    rule_map[r.id] = r.instruction
             result = []
             for inc in incidents:
                 d = {
                     "id": inc.id,
+                    "rule_id": inc.rule_id,
+                    "rule_instruction": rule_map.get(inc.rule_id),
                     "timestamp": inc.timestamp.isoformat() if inc.timestamp else None,
                     "violation": inc.violation_type,
                     "zone": inc.zone,
@@ -656,13 +696,19 @@ def get_stats(
 
 @app.get("/api/rules")
 def get_rules(
+    all: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    rules = db.query(Rule).filter(
-        Rule.status == "active",
-        Rule.site_id == current_user.site_id
-    ).all()
+    q = db.query(Rule).filter(Rule.site_id == current_user.site_id)
+    if not all:
+        q = q.filter(Rule.status == "active")
+    rules = q.order_by(Rule.created_at.desc()).all()
+    counts = dict(
+        db.query(Incident.rule_id, func.count(Incident.id))
+        .filter(Incident.site_id == current_user.site_id)
+        .group_by(Incident.rule_id).all()
+    )
     return [
         {
             "id": r.id,
@@ -673,6 +719,7 @@ def get_rules(
             "severity": r.severity,
             "zone_id": r.zone_id,
             "created_at": r.created_at.isoformat() if r.created_at else None,
+            "incident_count": counts.get(r.id, 0),
         }
         for r in rules
     ]
@@ -707,17 +754,16 @@ AVAILABLE MODELS:
 - "person"   - detects people on site (base YOLOv8, COCO trained)
 - "truck"    - detects trucks and heavy vehicles (base YOLOv8, COCO trained)
 - "helmet"   - detects construction hardhats (custom trained)
-- "vest"     - detects safety vests / hi-viz jackets (custom trained)
-- "forklift" - detects forklifts in warehouse and construction sites (custom trained, mAP 84%)
 - "fire"     - detects fire and flames (custom trained, mAP 75%)
 - "smoke"    - detects smoke on site (custom trained, mAP 75%)
-- "gloves"   - detects safety gloves on workers (custom trained, mAP 78%)
-- "ladder"   - detects ladders on construction sites (custom trained)
 
 AVAILABLE RULE TYPES:
 - "person_in_zone"  - alert when any person enters zone
 - "missing_in_zone" - alert when person without required gear enters
 - "count_exceeded"  - alert when more than N people in zone
+- "object_in_zone"  - alert when a specific OBJECT is detected inside the zone (no person needed). Use for instructions like "alert when fire/smoke/forklift/truck/ladder is detected". Set "target" to the model name, e.g. {"type": "object_in_zone", "zone": "site_area", "target": "fire", "required": []}
+
+IMPORTANT: "alert when X is detected" (fire, smoke, forklift, truck, ladder) means object_in_zone with target X — NOT person_in_zone. Every object_in_zone rule MUST include the "target" field, e.g. "target": "fire". Never omit it.
 
 OUTPUT FORMAT (must match exactly):
 {
@@ -727,7 +773,7 @@ OUTPUT FORMAT (must match exactly):
     "helmet": "runs/detect/helmet_model/weights/best.pt"
   },
   "zones": [{"name": "<zone_name>", "coords": [[100,200],[500,200],[500,600],[100,600]]}],
-  "rules": [{"type": "<rule_type>", "zone": "<zone_name>", "required": ["<gear>"], "primary": "person"}],
+   "rules": [{"type": "<rule_type>", "zone": "<zone_name>", "required": ["<gear>"], "primary": "person", "target": "<object_model_if_object_in_zone>"}],
   "alert": {"severity": "high", "message": "<alert message>"},
   "cooldown_seconds": 30
 }
@@ -777,6 +823,16 @@ async def generate_rule(
                 response_text = response_text[4:]
             response_text = response_text.strip()
         config = json.loads(response_text)
+        # ── Sanitizer: object_in_zone rules must carry a target; if the LLM
+        # forgot, infer it from the models it selected. ──
+        model_keys = [m for m in config.get("models", {}).keys() if m != "person"]
+        for r in config.get("rules", []):
+            if r.get("type") == "object_in_zone" and not r.get("target"):
+                if r.get("required"):
+                    r["target"] = r["required"][0]
+                elif model_keys:
+                    r["target"] = model_keys[0]
+                    print(f"[OMNIX] Sanitizer: filled missing target='{model_keys[0]}' on object_in_zone rule")
         return {"config": config, "instruction": instruction, "model_used": OLLAMA_MODEL, "provider": "ollama_local"}
     except requests.exceptions.ConnectionError:
         raise HTTPException(status_code=503, detail="Ollama is not running. Start it with: ollama serve")
@@ -853,6 +909,17 @@ async def apply_rule(
         if current_user.role != "admin":
             raise HTTPException(status_code=403, detail="Viewers cannot apply rules")
         try:
+            # ── Rule dedupe: re-applying the same instruction replaces the old
+            # row instead of stacking identical active rules forever. ──
+            dupes = db.query(Rule).filter(
+                Rule.site_id == current_user.site_id,
+                Rule.status == "active",
+                Rule.instruction == instruction,
+            ).all()
+            for d in dupes:
+                d.status = "replaced"
+            if dupes:
+                print(f"[OMNIX] Dedupe: marked {len(dupes)} identical active rule(s) as replaced")
             rule = Rule(
                 site_id=current_user.site_id, user_id=current_user.id,
                 instruction=instruction, config_json=new_config,
@@ -861,6 +928,10 @@ async def apply_rule(
             )
             db.add(rule)
             db.commit()
+            db.refresh(rule)
+            # ── stamp each new rule with its DB id so incidents attribute correctly ──
+            for r in new_config.get("rules", []):
+                r["rule_db_id"] = rule.id
         except Exception as e:
             print(f"[OMNIX] Warning: could not save rule to DB: {e}")
         config_path = Path("pipeline_config.json")
@@ -893,9 +964,6 @@ async def apply_rule(
         incidents_file = Path("incidents.json")
         if incidents_file.exists():
             incidents_file.unlink()
-        for f in Path("incidents").glob("*.jpg"):
-            try: f.unlink()
-            except: pass
         # ── RTSP Phase 1: pass the real camera_id through to run_pipeline.py ──
         _pipeline_process = subprocess.Popen(
             [sys.executable, "run_pipeline.py", "--camera_id", str(camera_id)],
@@ -922,13 +990,20 @@ def reset_rules(
 ):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Viewers cannot reset rules")
+    # ── Real reset: deactivate the DB rules too, not just the config file.
+    # (Previously rules stayed "active" in the DB and re-accumulated.) ──
+    deactivated = db.query(Rule).filter(
+        Rule.site_id == current_user.site_id,
+        Rule.status == "active",
+    ).update({"status": "inactive"})
+    db.commit()
     config_path = Path("pipeline_config.json")
     backup_path = Path("pipeline_config.backup.json")
     if config_path.exists():
         if backup_path.exists():
             backup_path.unlink()
         config_path.rename(backup_path)
-    return {"status": "reset", "message": "Pipeline config cleared."}
+    return {"status": "reset", "message": f"Pipeline config cleared, {deactivated} rule(s) deactivated."}
 
 
 # ── A: auth added ──
