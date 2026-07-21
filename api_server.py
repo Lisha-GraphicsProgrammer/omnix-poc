@@ -76,7 +76,7 @@ VIDEO_SOURCE_DEFAULT = _parse_source(os.getenv("VIDEO_SOURCE", "mega_cctv.mp4"))
 
 DEFAULT_SETTINGS = {
     "detection": {"alert_cooldown_frames": 150, "detection_confidence": 0.5, "bytetrack_buffer": 30, "persistence_frames": 5},
-    "alerts": {"channels": "dashboard", "deduplication_enabled": True, "email_notifications_enabled": False},
+    "alerts": {"channels": "dashboard", "deduplication_enabled": True, "email_notifications_enabled": False, "email_severity_threshold": "high"},
     "ai_model": {"frame_sampling": "every", "model_precision": "balanced"},
     "platform": {"llm_model": "claude-haiku", "site_name": "Site A — Construction", "api_endpoint": PUBLIC_BASE_URL},
 }
@@ -952,6 +952,9 @@ async def apply_rule(
         merged["persistence_frames"] = site_settings["detection"].get("persistence_frames", 5)
         merged["alert_cooldown_frames"] = site_settings["detection"].get("alert_cooldown_frames", 150)
         merged["detection_confidence"] = site_settings["detection"].get("detection_confidence", 0.5)
+        # ── Task C fold-in: email notification settings, same "one config, pipeline reads it" pattern ──
+        merged["email_notifications_enabled"] = site_settings["alerts"].get("email_notifications_enabled", False)
+        merged["email_severity_threshold"] = site_settings["alerts"].get("email_severity_threshold", "high")
 
         with open(config_path, "w") as f:
             json.dump(merged, f, indent=2)

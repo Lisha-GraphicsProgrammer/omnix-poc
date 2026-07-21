@@ -72,3 +72,9 @@ If a camera's `source` field is an `rtsp://` URL pointing at a device on your LA
 - `omnix_pg_data` — Postgres data directory, survives `docker compose down` (not `down -v`)
 - `omnix_incidents` — incident screenshots (`incidents/*.jpg`), same persistence behavior
 - `./runs`, model weight files, and test videos are **bind-mounted** rather than copied into the image, since they're multi-GB and change independently of application code — baking them into the image would make every rebuild slow and bloat image size unnecessarily
+| `SMTP_HOST` | (none) | SMTP server for outgoing alert emails. If unset, email notifications silently no-op regardless of the Settings toggle |
+| `SMTP_PORT` | `587` | SMTP port (STARTTLS) |
+| `SMTP_USER` | (none) | SMTP auth username, if your provider requires it |
+| `SMTP_PASSWORD` | (none) | SMTP auth password |
+| `SMTP_FROM` | `SMTP_USER` or `omnix-alerts@localhost` | From address on outgoing alert emails |
+| `ALERT_EMAIL_TO` | (none) | Comma-separated recipient list. If unset, email notifications silently no-op |
