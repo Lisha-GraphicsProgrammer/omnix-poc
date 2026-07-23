@@ -756,15 +756,17 @@ AVAILABLE MODELS:
 - "helmet"   - detects construction hardhats (custom trained)
 - "fire"     - detects fire and flames (custom trained, mAP 75%)
 - "smoke"    - detects smoke on site (custom trained, mAP 75%)
+- "spill"    - detects liquid spills / hazardous liquids on floors (custom trained, mAP 88%)
 
 AVAILABLE RULE TYPES:
 - "person_in_zone"  - alert when any person enters zone
 - "missing_in_zone" - alert when person without required gear enters
 - "count_exceeded"  - alert when more than N people in zone
 - "object_in_zone"  - alert when a specific OBJECT is detected inside the zone (no person needed). Use for instructions like "alert when fire/smoke/forklift/truck/ladder is detected". Set "target" to the model name, e.g. {"type": "object_in_zone", "zone": "site_area", "target": "fire", "required": []}
+- "person_near_object" - alert when a person comes close to a detected object. Use "target": "<model>" and "proximity_px": <number>. For "near acid/dangerous liquid/spill/chemical", use target "spill". Example: {"type": "person_near_object", "target": "spill", "proximity_px": 120}
 
 IMPORTANT: "alert when X is detected" (fire, smoke, forklift, truck, ladder) means object_in_zone with target X — NOT person_in_zone. Every object_in_zone rule MUST include the "target" field, e.g. "target": "fire". Never omit it.
-
+IMPORTANT: "alert everyone near acid/spill/chemical/hazardous liquid" means person_near_object with target "spill" — NOT object_in_zone (this rule cares about people approaching the object, not just the object's presence). Never omit "target" on a person_near_object rule.
 OUTPUT FORMAT (must match exactly):
 {
   "pipeline_id": "auto_<short_descriptive_name>",
@@ -823,16 +825,19 @@ async def generate_rule(
                 response_text = response_text[4:]
             response_text = response_text.strip()
         config = json.loads(response_text)
-        # ── Sanitizer: object_in_zone rules must carry a target; if the LLM
-        # forgot, infer it from the models it selected. ──
+        # ── Sanitizer: object_in_zone AND person_near_object rules must carry a
+        # target; if the LLM forgot, infer it from the models it selected. ──
         model_keys = [m for m in config.get("models", {}).keys() if m != "person"]
         for r in config.get("rules", []):
-            if r.get("type") == "object_in_zone" and not r.get("target"):
+            if r.get("type") in ("object_in_zone", "person_near_object") and not r.get("target"):
                 if r.get("required"):
                     r["target"] = r["required"][0]
                 elif model_keys:
                     r["target"] = model_keys[0]
-                    print(f"[OMNIX] Sanitizer: filled missing target='{model_keys[0]}' on object_in_zone rule")
+                    print(f"[OMNIX] Sanitizer: filled missing target='{model_keys[0]}' on {r.get('type')} rule")
+            # person_near_object without proximity_px gets the spec's default (854x480-relative, scaled by the pipeline)
+            if r.get("type") == "person_near_object" and not r.get("proximity_px"):
+                r["proximity_px"] = 120
         return {"config": config, "instruction": instruction, "model_used": OLLAMA_MODEL, "provider": "ollama_local"}
     except requests.exceptions.ConnectionError:
         raise HTTPException(status_code=503, detail="Ollama is not running. Start it with: ollama serve")

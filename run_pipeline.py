@@ -294,7 +294,7 @@ rules = config.get('rules', [])
 print(f"Active zones: {list(zones_map.keys())}")
 print(f"Active rules:")
 for r in rules:
-    print(f"  - {r['type']} in {r['zone']} (required: {r.get('required', [])})")
+    print(f"  - {r['type']} in {r.get('zone', 'anywhere')} (required: {r.get('required', [])})")
 print()
 
 # ============================================================
@@ -327,6 +327,11 @@ print(f"[INFO] Original video resolution: {ORIG_W}x{ORIG_H}\n")
 
 # Scale user-drawn zone polygons from snapshot space (854x480) to native res
 SNAP_W, SNAP_H = 854, 480
+# ── Part 2: person_near_object's proximity_px is specified at 854x480 (per spec) —
+# scale it to whatever the actual native video resolution is ──
+SCALE_X = (ORIG_W / SNAP_W) if ORIG_W else 1.0
+SCALE_Y = (ORIG_H / SNAP_H) if ORIG_H else 1.0
+PROXIMITY_SCALE = (SCALE_X + SCALE_Y) / 2
 for zn, zd in zones_map.items():
     if zd['source'] == 'user_drawn' and ORIG_W and ORIG_H:
         sx, sy = ORIG_W / SNAP_W, ORIG_H / SNAP_H
@@ -441,6 +446,117 @@ try:
                     if frame_idx - active_violations[obj_key] > ALERT_COOLDOWN_FRAMES:
                         del active_violations[obj_key]
 
+        # ============================================================
+        # ── person_near_object rules: PER-FRAME, checks pixel distance from
+        # each tracked person's bbox bottom-center to the nearest edge of the
+        # target object's bbox (e.g. "person near spill"). Honest limitation:
+        # pixel distance ≠ real meters (no camera calibration) — acceptable
+        # for POC, calibration is a someday-item. ──
+        # ============================================================
+        has_people_this_frame = result.boxes is not None and result.boxes.id is not None
+        person_boxes_this_frame = (
+            list(zip(result.boxes.xyxy.cpu().numpy(), result.boxes.id.cpu().numpy()))
+            if has_people_this_frame else []
+        )
+
+        for rule_idx, rule in enumerate(rules):
+            if rule.get('type') != 'person_near_object':
+                continue
+            target = rule.get('target')
+            if not target or target not in models or not person_boxes_this_frame:
+                continue
+
+            conf = get_model_conf(target, fallback=GLOBAL_DETECTION_CONFIDENCE)
+            entry = registry.get(target, {})
+            if entry.get("type") == "coco_default":
+                obj_results = models[target](result.orig_img, verbose=False,
+                                             conf=conf, classes=[entry.get("class_id", 0)])
+            else:
+                obj_results = models[target](result.orig_img, verbose=False, conf=conf)
+
+            obj_boxes = []
+            if obj_results[0].boxes is not None and len(obj_results[0].boxes) > 0:
+                obj_boxes = list(obj_results[0].boxes.xyxy.cpu().numpy())
+
+            proximity_px_native = float(rule.get('proximity_px', 120)) * PROXIMITY_SCALE
+
+            for pbox, ptid in person_boxes_this_frame:
+                person_id = int(ptid)
+                px1, py1, px2, py2 = pbox
+                person_center_x = (px1 + px2) / 2
+                person_bottom_y = py2  # bottom-center, same convention as zone rules
+
+                cooldown_key = (rule_idx, person_id)
+
+                # nearest-edge distance from person's bottom-center to each object bbox
+                nearest_obj = None
+                nearest_dist = float('inf')
+                for ob in obj_boxes:
+                    ox1, oy1, ox2, oy2 = ob
+                    dx = max(ox1 - person_center_x, 0, person_center_x - ox2)
+                    dy = max(oy1 - person_bottom_y, 0, person_bottom_y - oy2)
+                    dist = (dx ** 2 + dy ** 2) ** 0.5
+                    if dist < nearest_dist:
+                        nearest_dist = dist
+                        nearest_obj = ob
+
+                if nearest_obj is not None and nearest_dist < proximity_px_native:
+                    streak_counters[cooldown_key] = streak_counters.get(cooldown_key, 0) + 1
+                    current_streak = streak_counters[cooldown_key]
+
+                    if current_streak >= PERSISTENCE_FRAMES and cooldown_key not in active_violations:
+                        incident_count += 1
+                        incident_id = f"inc_{incident_count:04d}"
+                        screenshot_path = f"incidents/{incident_id}.jpg"
+                        orig_frame = result.orig_img.copy()
+
+                        # box the violating person — blue, same convention as other person boxes
+                        bx1, by1, bx2, by2 = map(int, pbox)
+                        cv2.rectangle(orig_frame, (bx1, by1), (bx2, by2), (255, 100, 0), 2)
+                        label = f"id:{person_id} person"
+                        (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+                        cv2.rectangle(orig_frame, (bx1, by1 - lh - 8), (bx1 + lw + 4, by1), (255, 100, 0), -1)
+                        cv2.putText(orig_frame, label, (bx1 + 2, by1 - 4),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
+                        # box the target object — red, same convention as object_in_zone's target color
+                        ox1, oy1, ox2, oy2 = map(int, nearest_obj)
+                        cv2.rectangle(orig_frame, (ox1, oy1), (ox2, oy2), (0, 0, 255), 2)
+                        cv2.putText(orig_frame, target.upper(), (ox1 + 2, max(oy1 - 6, 14)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+                        cv2.putText(orig_frame, f"NEAR {target.upper()} streak={current_streak}",
+                                    (10, orig_frame.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+                        cv2.imwrite(screenshot_path, orig_frame)
+
+                        incident = {
+                            "id":              incident_id,
+                            "timestamp":       datetime.now().isoformat(),
+                            "frame":           frame_idx,
+                            "camera":          video,
+                            "person_id":       person_id,
+                            "violation":       f"near_{target}",
+                            "missing_gear":    [],
+                            "zone":            rule.get('zone', ''),
+                            "rule_index":      rule_idx,
+                            "bbox":            [float(px1), float(py1), float(px2), float(py2)],
+                            "screenshot_path": screenshot_path,
+                            "rule_type":       "person_near_object",
+                            "alert_message":   config['alert']['message'],
+                            "streak_frames":   current_streak,
+                            "rule_db_id":      rule.get("rule_db_id"),
+                        }
+                        append_incident(incident)
+                        print(f"Frame {frame_idx}: person #{person_id} | rule[{rule_idx}] person_near_object "
+                              f"target={target} dist={nearest_dist:.0f}px | streak={current_streak} → {incident_id} [FIRED]")
+                        active_violations[cooldown_key] = frame_idx
+                else:
+                    if cooldown_key in streak_counters:
+                        del streak_counters[cooldown_key]
+                    if cooldown_key in active_violations:
+                        if frame_idx - active_violations[cooldown_key] > ALERT_COOLDOWN_FRAMES:
+                            del active_violations[cooldown_key]
+
         if result.boxes is None or result.boxes.id is None:
             continue
 
@@ -457,8 +573,8 @@ try:
 
                 zone          = zones_map[zone_name]
                 rule_type     = rule.get('type', '')
-                if rule_type == 'object_in_zone':
-                    continue  # handled per-frame above, not per-person
+                if rule_type in ('object_in_zone', 'person_near_object'):
+                    continue  # both handled per-frame above, not in this per-person zone loop
                 required_gear = rule.get('required', [])
 
                 in_zone = point_in_polygon(person_center_x, person_bottom_y, zone['poly'])
