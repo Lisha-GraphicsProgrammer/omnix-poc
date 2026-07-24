@@ -305,6 +305,7 @@ if INCIDENTS_FILE.exists():
     INCIDENTS_FILE.unlink()
 
 incident_count = 0
+RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 # ── Part 1: Cooldown tracker (existing) ──
 active_violations = {}
@@ -398,7 +399,7 @@ try:
                 current_streak = streak_counters[obj_key]
                 if current_streak >= PERSISTENCE_FRAMES and obj_key not in active_violations:
                     incident_count += 1
-                    incident_id = f"inc_{incident_count:04d}"
+                    incident_id = f"inc_{RUN_ID}_{incident_count:04d}"
                     screenshot_path = f"incidents/{incident_id}.jpg"
                     orig_frame = result.orig_img.copy()
                     for ob in hits:
@@ -506,7 +507,7 @@ try:
 
                     if current_streak >= PERSISTENCE_FRAMES and cooldown_key not in active_violations:
                         incident_count += 1
-                        incident_id = f"inc_{incident_count:04d}"
+                        incident_id = f"inc_{RUN_ID}_{incident_count:04d}"
                         screenshot_path = f"incidents/{incident_id}.jpg"
                         orig_frame = result.orig_img.copy()
 
@@ -620,7 +621,7 @@ try:
                     # AND not in cooldown
                     if current_streak >= PERSISTENCE_FRAMES and cooldown_key not in active_violations:
                         incident_count += 1
-                        incident_id     = f"inc_{incident_count:04d}"
+                        incident_id     = f"inc_{RUN_ID}_{incident_count:04d}"
                         screenshot_path = f"incidents/{incident_id}.jpg"
 
                         # ── Part 1: screenshot taken at frame N (when incident fires) ──
