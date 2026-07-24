@@ -307,6 +307,12 @@ if INCIDENTS_FILE.exists():
 incident_count = 0
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+# ── Occlusion fix: remember each proximity target's last-seen boxes for a
+# short window. A puddle doesn't walk away — if detection drops the moment
+# a person steps INTO it (occlusion), proximity must still fire. ──
+OBJECT_MEMORY_FRAMES = 50
+object_memory = {}  # rule_idx -> {"boxes": [...], "last_seen": frame_idx}
+
 # ── Part 1: Cooldown tracker (existing) ──
 active_violations = {}
 
@@ -478,6 +484,17 @@ try:
             obj_boxes = []
             if obj_results[0].boxes is not None and len(obj_results[0].boxes) > 0:
                 obj_boxes = list(obj_results[0].boxes.xyxy.cpu().numpy())
+
+            # ── Occlusion fix: live detection refreshes memory; a dropout
+            # within OBJECT_MEMORY_FRAMES falls back to the last-seen boxes
+            # (person standing IN the spill hides it from the detector —
+            # exactly the moment the alert matters most). ──
+            if obj_boxes:
+                object_memory[rule_idx] = {"boxes": obj_boxes, "last_seen": frame_idx}
+            else:
+                mem = object_memory.get(rule_idx)
+                if mem and frame_idx - mem["last_seen"] <= OBJECT_MEMORY_FRAMES:
+                    obj_boxes = mem["boxes"]
 
             proximity_px_native = float(rule.get('proximity_px', 120)) * PROXIMITY_SCALE
 
