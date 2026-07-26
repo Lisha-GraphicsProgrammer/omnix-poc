@@ -13,6 +13,21 @@ load_dotenv()
 from db.session import SessionLocal
 from db.models import Incident, Rule, Site, Camera as CameraModel
 
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
+
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "omnix-alerts@localhost")
+ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO")  # comma-separated list
+
+EMAIL_SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
 # ============================================================
 # CONFIG LOADING
 # ============================================================
@@ -28,6 +43,10 @@ PERSISTENCE_FRAMES = int(config.get('persistence_frames', 5))
 ALERT_COOLDOWN_FRAMES = int(config.get('alert_cooldown_frames', 150))
 GLOBAL_DETECTION_CONFIDENCE = float(config.get('detection_confidence', 0.5))
 
+# ── Task C fold-in: email settings, same DB-Settings → pipeline_config.json → pipeline reads it pattern ──
+EMAIL_NOTIFICATIONS_ENABLED = bool(config.get('email_notifications_enabled', False))
+EMAIL_SEVERITY_THRESHOLD = config.get('email_severity_threshold', 'high')
+
 print(f"\n{'='*60}")
 print(f"Pipeline: {config['pipeline_id']}")
 print(f"Description: {config['description']}")
@@ -36,6 +55,7 @@ print(f"Rules: {len(config.get('rules', []))}")
 print(f"Persistence frames: {PERSISTENCE_FRAMES}")
 print(f"Alert cooldown frames: {ALERT_COOLDOWN_FRAMES}")
 print(f"Global detection confidence: {GLOBAL_DETECTION_CONFIDENCE}")
+print(f"Email notifications: {'enabled (threshold=' + EMAIL_SEVERITY_THRESHOLD + ')' if EMAIL_NOTIFICATIONS_ENABLED else 'disabled'}")
 print(f"{'='*60}\n")
 
 # ============================================================
@@ -163,6 +183,58 @@ print(f"[INFO] Total models loaded: {list(models.keys())}\n")
 # ============================================================
 INCIDENTS_FILE = Path('incidents.json')
 
+# ============================================================
+# HELPER: email notification for a new incident
+# ============================================================
+def send_incident_email(incident: dict):
+    """Sends an email for a new incident, if SMTP is configured, email is enabled
+    in Settings, and the incident's severity meets the configured threshold.
+    Fires from the same single trigger point as DB/JSON incident writes — one
+    event, one place — rather than a separate notification pipeline."""
+    if not SMTP_HOST or not ALERT_EMAIL_TO:
+        return  # Not configured — silently skip, no need to log every incident
+    if not EMAIL_NOTIFICATIONS_ENABLED:
+        return
+
+    incident_severity = config.get("alert", {}).get("severity", "medium")
+    if EMAIL_SEVERITY_ORDER.get(incident_severity, 1) < EMAIL_SEVERITY_ORDER.get(EMAIL_SEVERITY_THRESHOLD, 2):
+        return
+
+    recipients = [r.strip() for r in ALERT_EMAIL_TO.split(",") if r.strip()]
+    if not recipients:
+        return
+
+    screenshot_link = f"{PUBLIC_BASE_URL}/{incident['screenshot_path']}"
+    violation_label = (incident.get('violation') or 'violation').replace('_', ' ')
+    subject = f"[OMNIX] {incident_severity.upper()} violation: {violation_label}"
+    body = (
+        f"A new violation was detected by OMNIX.\n\n"
+        f"Violation: {violation_label}\n"
+        f"Zone: {incident.get('zone', 'unknown')}\n"
+        f"Camera: {incident.get('camera', 'unknown')}\n"
+        f"Time: {incident.get('timestamp', '')}\n"
+        f"Severity: {incident_severity}\n\n"
+        f"Screenshot: {screenshot_link}\n\n"
+        f"This is an automated message from OMNIX Safety Monitoring."
+    )
+
+    msg = MIMEMultipart()
+    msg["From"] = SMTP_FROM
+    msg["To"] = ", ".join(recipients)
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+            server.starttls()
+            if SMTP_USER and SMTP_PASSWORD:
+                server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_FROM, recipients, msg.as_string())
+        print(f"  [EMAIL] Sent alert email to {', '.join(recipients)}")
+    except Exception as e:
+        print(f"  [WARN] Failed to send alert email: {e}")
+
+
 def append_incident(incident: dict):
     if rule_id and site_id:
         try:
@@ -193,6 +265,7 @@ def append_incident(incident: dict):
             _append_json(incident)
     else:
         _append_json(incident)
+    send_incident_email(incident)
 
 
 def _append_json(incident: dict):
