@@ -4,5 +4,5 @@
   "helmet":   { "type": "custom", "weights": "runs/detect/helmet_model/weights/best.pt", "confidence": 0.65, "conf_threshold": 0.5 },
   "fire":     { "type": "custom", "weights": "runs/detect/fire_model/weights/best.pt", "confidence": 0.7, "conf_threshold": 0.6 },
   "smoke":    { "type": "custom", "weights": "runs/detect/smoke_model/weights/best.pt", "confidence": 0.7, "conf_threshold": 0.6 },
-  "spill":    { "type": "custom", "weights": "runs/detect/spill_model/weights/best.pt", "confidence": 0.5, "conf_threshold": 0.5 }
+  "spill":    { "type": "custom", "weights": "runs/detect/spill_model/weights/best.pt", "confidence": 0.5, "conf_threshold": 0.6 }
 }

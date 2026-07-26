@@ -767,6 +767,7 @@ AVAILABLE RULE TYPES:
 
 IMPORTANT: "alert when X is detected" (fire, smoke, forklift, truck, ladder) means object_in_zone with target X — NOT person_in_zone. Every object_in_zone rule MUST include the "target" field, e.g. "target": "fire". Never omit it.
 IMPORTANT: "alert everyone near acid/spill/chemical/hazardous liquid" means person_near_object with target "spill" — NOT object_in_zone (this rule cares about people approaching the object, not just the object's presence). Never omit "target" on a person_near_object rule.
+For URGENT hazards (acid, fire, chemicals, danger, "immediately"), add "persistence_frames": 2 to the rule. Routine rules omit it.
 OUTPUT FORMAT (must match exactly):
 {
   "pipeline_id": "auto_<short_descriptive_name>",
@@ -775,10 +776,12 @@ OUTPUT FORMAT (must match exactly):
     "helmet": "runs/detect/helmet_model/weights/best.pt"
   },
   "zones": [{"name": "<zone_name>", "coords": [[100,200],[500,200],[500,600],[100,600]]}],
-   "rules": [{"type": "<rule_type>", "zone": "<zone_name>", "required": ["<gear>"], "primary": "person", "target": "<object_model_if_object_in_zone>"}],
+  "rules": [{"type": "<rule_type>", "zone": "<zone_name>", "required": ["<gear>"], "primary": "person", "target": "<object_model_if_object_or_proximity_rule>", "persistence_frames": 2, "proximity_px": 120}],
   "alert": {"severity": "high", "message": "<alert message>"},
   "cooldown_seconds": 30
 }
+
+NOTE on optional rule fields: include "persistence_frames" only for urgent hazards (value 2); include "proximity_px" only on person_near_object rules; include "target" only on object_in_zone and person_near_object rules. Omit fields that don't apply.
 
 Only include models actually needed. Output ONLY the JSON. No markdown, no explanation."""
 
