@@ -652,6 +652,87 @@ try:
                         if frame_idx - active_violations[cooldown_key] > ALERT_COOLDOWN_FRAMES:
                             del active_violations[cooldown_key]
 
+        # ============================================================
+        # ── count_exceeded rules: PER-FRAME, per-zone person count vs threshold.
+        # Previously a stub that fired for any single person present, regardless
+        # of actual count. Real logic: tally how many currently-tracked people
+        # are inside the rule's zone this frame, compare to the "count" field.
+        # This is an aggregate/zone-level violation (no single culprit), so it's
+        # keyed by rule_idx alone, not per-person like the other rule types. ──
+        # ============================================================
+        zone_person_counts: dict = {}
+        for pbox, ptid in person_boxes_this_frame:
+            pcx = (pbox[0] + pbox[2]) / 2
+            pby = pbox[3]
+            for zn, zd in zones_map.items():
+                if point_in_polygon(pcx, pby, zd['poly']):
+                    zone_person_counts[zn] = zone_person_counts.get(zn, 0) + 1
+
+        for rule_idx, rule in enumerate(rules):
+            if rule.get('type') != 'count_exceeded':
+                continue
+            zone_name = rule.get('zone', '')
+            threshold = int(rule.get('count', 5))
+            current_count = zone_person_counts.get(zone_name, 0)
+            cooldown_key = (rule_idx, 'zone_count')  # aggregate violation, not person-specific
+
+            if current_count > threshold:
+                streak_counters[cooldown_key] = streak_counters.get(cooldown_key, 0) + 1
+                current_streak = streak_counters[cooldown_key]
+                rule_persistence = int(rule.get('persistence_frames') or PERSISTENCE_FRAMES)
+
+                if current_streak >= rule_persistence and cooldown_key not in active_violations:
+                    incident_count += 1
+                    incident_id = f"inc_{RUN_ID}_{incident_count:04d}"
+                    screenshot_path = f"incidents/{incident_id}.jpg"
+                    orig_frame = result.orig_img.copy()
+
+                    # box every currently-tracked person, so the crowd is visible in the evidence frame
+                    if result.boxes is not None and result.boxes.id is not None:
+                        for det_box, det_id in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.id.cpu().numpy()):
+                            dbx1, dby1, dbx2, dby2 = map(int, det_box)
+                            cv2.rectangle(orig_frame, (dbx1, dby1), (dbx2, dby2), (255, 100, 0), 2)
+
+                    for zn, zd in zones_map.items():
+                        color = (0, 255, 255) if zn == zone_name else (0, 180, 180)
+                        pts = np.array(zd['poly'], dtype=np.int32).reshape((-1, 1, 2))
+                        cv2.polylines(orig_frame, [pts], isClosed=True, color=color, thickness=2)
+                        cv2.putText(orig_frame, zn.replace("_", " ").upper(),
+                                    (int(zd['x_min']) + 4, int(zd['y_min']) + 18),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+                    cv2.putText(orig_frame, f"COUNT EXCEEDED: {current_count} > {threshold} streak={current_streak}",
+                                (10, orig_frame.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+                    cv2.imwrite(screenshot_path, orig_frame)
+
+                    incident = {
+                        "id":              incident_id,
+                        "timestamp":       datetime.now().isoformat(),
+                        "frame":           frame_idx,
+                        "camera":          video,
+                        "person_id":       None,  # aggregate zone violation, no single culprit
+                        "violation":       "count_exceeded",
+                        "missing_gear":    [],
+                        "zone":            zone_name,
+                        "rule_index":      rule_idx,
+                        "bbox":            None,
+                        "screenshot_path": screenshot_path,
+                        "rule_type":       "count_exceeded",
+                        "alert_message":   config['alert']['message'],
+                        "streak_frames":   current_streak,
+                        "rule_db_id":      rule.get("rule_db_id"),
+                    }
+                    append_incident(incident)
+                    print(f"Frame {frame_idx}: rule[{rule_idx}] count_exceeded in {zone_name} "
+                          f"count={current_count} > {threshold} | streak={current_streak} → {incident_id} [FIRED]")
+                    active_violations[cooldown_key] = frame_idx
+            else:
+                if cooldown_key in streak_counters:
+                    del streak_counters[cooldown_key]
+                if cooldown_key in active_violations:
+                    if frame_idx - active_violations[cooldown_key] > ALERT_COOLDOWN_FRAMES:
+                        del active_violations[cooldown_key]
+
         if result.boxes is None or result.boxes.id is None:
             continue
 
@@ -668,8 +749,8 @@ try:
 
                 zone          = zones_map[zone_name]
                 rule_type     = rule.get('type', '')
-                if rule_type in ('object_in_zone', 'person_near_object'):
-                    continue  # both handled per-frame above, not in this per-person zone loop
+                if rule_type in ('object_in_zone', 'person_near_object', 'count_exceeded'):
+                    continue  # all three handled per-frame above, not in this per-person zone loop
                 required_gear = rule.get('required', [])
 
                 in_zone = point_in_polygon(person_center_x, person_bottom_y, zone['poly'])
@@ -701,10 +782,6 @@ try:
 
                 elif rule_type == "person_in_zone":
                     violation_occurred = True
-
-                elif rule_type == "count_exceeded":
-                    violation_occurred = True
-                    violation_type = "person_in_zone"
 
                 if violation_occurred:
                     # ── Part 1: increment streak counter ──
