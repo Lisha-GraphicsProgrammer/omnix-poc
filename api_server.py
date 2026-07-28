@@ -264,6 +264,22 @@ def on_startup():
             cam.status = "online" if vs else "offline"
             print(f"[OMNIX] Camera {cam.id} ({cam.name}): {'started' if vs else 'offline'} — source={cam.source}")
         db.commit()
+
+        # ── Task 2: fresh-deploy safety net — if pipeline_config.json is missing
+        # (new box, or accidentally deleted) but the DB already has active rules,
+        # rebuild the file from DB state instead of leaving the pipeline blind
+        # to rules that were already configured on a previous deploy. ──
+        config_path = Path("pipeline_config.json")
+        if not config_path.exists():
+            site = db.query(Site).first()
+            if site:
+                rebuilt = rebuild_pipeline_config_from_db(db, site.id)
+                if rebuilt.get("rules"):
+                    with open(config_path, "w") as f:
+                        json.dump(rebuilt, f, indent=2)
+                    print(f"[OMNIX] pipeline_config.json was missing — rebuilt from {len(rebuilt['rules'])} active DB rule(s)")
+                else:
+                    print(f"[OMNIX] pipeline_config.json missing, and no active DB rules to rebuild from")
     finally:
         db.close()
     threading.Thread(target=_reconnect_monitor, daemon=True).start()
@@ -659,6 +675,27 @@ async def review_incident(
 
 
 # ── A: auth added ──
+# ── Task 2: manual rebuild trigger — useful for ops/testing without restarting
+# the whole backend, and to recover if the file gets corrupted/deleted mid-session ──
+@app.post("/api/pipeline/rebuild")
+def rebuild_pipeline_config(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can rebuild the pipeline config")
+    rebuilt = rebuild_pipeline_config_from_db(db, current_user.site_id)
+    config_path = Path("pipeline_config.json")
+    with open(config_path, "w") as f:
+        json.dump(rebuilt, f, indent=2)
+    return {
+        "status": "rebuilt",
+        "total_rules": len(rebuilt.get("rules", [])),
+        "total_zones": len(rebuilt.get("zones", [])),
+        "pipeline_id": rebuilt.get("pipeline_id"),
+    }
+
+
 @app.get("/api/pipeline")
 def get_pipeline(current_user: User = Depends(get_current_user)):
     with open("pipeline_config.json", "r") as f:
@@ -761,7 +798,7 @@ AVAILABLE MODELS:
 AVAILABLE RULE TYPES:
 - "person_in_zone"  - alert when any person enters zone
 - "missing_in_zone" - alert when person without required gear enters
-- "count_exceeded"  - alert when more than N people in zone
+- "count_exceeded"  - alert when more than N people in zone. Set "count" to N, e.g. {"type": "count_exceeded", "zone": "warehouse", "count": 10}. Never omit "count" — if the instruction doesn't state a number, use a sensible default like 5.
 - "object_in_zone"  - alert when a specific OBJECT is detected inside the zone (no person needed). Use for instructions like "alert when fire/smoke/forklift/truck/ladder is detected". Set "target" to the model name, e.g. {"type": "object_in_zone", "zone": "site_area", "target": "fire", "required": []}
 - "person_near_object" - alert when a person comes close to a detected object. Use "target": "<model>" and "proximity_px": <number>. For "near acid/dangerous liquid/spill/chemical", use target "spill". Example: {"type": "person_near_object", "target": "spill", "proximity_px": 120}
 
@@ -776,13 +813,12 @@ OUTPUT FORMAT (must match exactly):
     "helmet": "runs/detect/helmet_model/weights/best.pt"
   },
   "zones": [{"name": "<zone_name>", "coords": [[100,200],[500,200],[500,600],[100,600]]}],
-  "rules": [{"type": "<rule_type>", "zone": "<zone_name>", "required": ["<gear>"], "primary": "person", "target": "<object_model_if_object_or_proximity_rule>", "persistence_frames": 2, "proximity_px": 120}],
+  "rules": [{"type": "<rule_type>", "zone": "<zone_name>", "required": ["<gear>"], "primary": "person", "target": "<object_model_if_object_or_proximity_rule>", "persistence_frames": 2, "proximity_px": 120, "count": 5}],
   "alert": {"severity": "high", "message": "<alert message>"},
   "cooldown_seconds": 30
 }
 
-NOTE on optional rule fields: include "persistence_frames" only for urgent hazards (value 2); include "proximity_px" only on person_near_object rules; include "target" only on object_in_zone and person_near_object rules. Omit fields that don't apply.
-
+NOTE on optional rule fields: include "persistence_frames" only for urgent hazards (value 2); include "proximity_px" only on person_near_object rules; include "target" only on object_in_zone and person_near_object rules; include "count" only on count_exceeded rules. Omit fields that don't apply.
 Only include models actually needed. Output ONLY the JSON. No markdown, no explanation."""
 
 
@@ -841,6 +877,11 @@ async def generate_rule(
             # person_near_object without proximity_px gets the spec's default (854x480-relative, scaled by the pipeline)
             if r.get("type") == "person_near_object" and not r.get("proximity_px"):
                 r["proximity_px"] = 120
+            # count_exceeded without a count threshold gets a sensible default — the
+            # pipeline also defaults to 5 if this is somehow still missing at runtime
+            if r.get("type") == "count_exceeded" and not r.get("count"):
+                r["count"] = 5
+                print(f"[OMNIX] Sanitizer: filled missing count=5 on count_exceeded rule")
         return {"config": config, "instruction": instruction, "model_used": OLLAMA_MODEL, "provider": "ollama_local"}
     except requests.exceptions.ConnectionError:
         raise HTTPException(status_code=503, detail="Ollama is not running. Start it with: ollama serve")
@@ -867,6 +908,50 @@ def enrich_zone_coords(config: dict, db: Session, site_id: int) -> dict:
             zone["source"] = "user_drawn"
             print(f"[OMNIX] Zone '{name}': using user-drawn polygon ({len(polygon)} points)")
     return config
+
+
+def rebuild_pipeline_config_from_db(db: Session, site_id: int) -> dict:
+    """
+    Rebuilds pipeline_config.json purely from the currently-active Rule rows in
+    the DB, folding them together with the same merge_configs() logic apply_rule
+    already uses incrementally. This lets a fresh deploy (no existing
+    pipeline_config.json on disk, or one that was wiped/lost) reconstruct the
+    full active-rules state, instead of the pipeline only ever reflecting
+    whichever single rule happens to be applied next.
+    """
+    active_rules = db.query(Rule).filter(
+        Rule.site_id == site_id,
+        Rule.status == "active",
+    ).order_by(Rule.created_at.asc()).all()
+
+    if not active_rules:
+        return {
+            "pipeline_id": "auto_empty",
+            "description": "No active rules",
+            "models": {},
+            "zones": [],
+            "rules": [],
+            "alert": {"severity": "medium", "message": "No active rules"},
+            "cooldown_seconds": 30,
+        }
+
+    def stamp(cfg: dict, rule_db_id: int) -> dict:
+        # Deep copy so we never mutate the SQLAlchemy-tracked dict in place —
+        # re-stamp rule_db_id from the authoritative Rule.id at rebuild time,
+        # since the original apply-time stamping (mutating after db.commit())
+        # isn't guaranteed to have actually persisted to the JSON column.
+        cfg = json.loads(json.dumps(cfg))
+        for r in cfg.get("rules", []):
+            r["rule_db_id"] = rule_db_id
+        return cfg
+
+    merged = stamp(active_rules[0].config_json, active_rules[0].id)
+    for db_rule in active_rules[1:]:
+        stamped_cfg = stamp(db_rule.config_json, db_rule.id)
+        merged = merge_configs(merged, stamped_cfg)
+
+    merged = enrich_zone_coords(merged, db, site_id)
+    return merged
 
 
 def merge_configs(existing: dict, new_cfg: dict) -> dict:
