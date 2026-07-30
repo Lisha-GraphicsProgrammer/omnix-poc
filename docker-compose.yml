@@ -28,7 +28,7 @@ services:
       DATABASE_URL: postgresql://omnix:omnix_dev_password@postgres:5432/omnix
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
-      VIDEO_SOURCE: ${VIDEO_SOURCE:-test_video.mp4}
+      VIDEO_SOURCE: ${VIDEO_SOURCE:-mega_cctv_v2.mp4}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
     ports:
       - "8000:8000"
@@ -37,6 +37,7 @@ services:
       - ./runs:/app/runs
       - ./test_video.mp4:/app/test_video.mp4
       - ./construction.mp4:/app/construction.mp4
+      - ./mega_cctv_v2.mp4:/app/mega_cctv_v2.mp4
       - ./model_registry.json:/app/model_registry.json
 
 volumes:
