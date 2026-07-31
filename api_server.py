@@ -1016,8 +1016,20 @@ def rebuild_pipeline_config_from_db(db: Session, site_id: int) -> dict:
     for db_rule in active_rules[1:]:
         stamped_cfg = stamp(db_rule.config_json, db_rule.id)
         merged = merge_configs(merged, stamped_cfg)
-
     merged = enrich_zone_coords(merged, db, site_id)
+
+    # ── Fix per Hains' review (re-applied — this was lost in an earlier merge):
+    # apply_rule() injects these site-wide settings at apply time, but a
+    # rebuild-from-DB skipped this entirely, meaning a rebuild could silently
+    # turn email off even when Settings says on. Same injection now happens
+    # in both paths, using the same get_settings_for_site() source of truth. ──
+    site_settings = get_settings_for_site(db, site_id)
+    merged["persistence_frames"] = site_settings["detection"].get("persistence_frames", 5)
+    merged["alert_cooldown_frames"] = site_settings["detection"].get("alert_cooldown_frames", 150)
+    merged["detection_confidence"] = site_settings["detection"].get("detection_confidence", 0.5)
+    merged["email_notifications_enabled"] = site_settings["alerts"].get("email_notifications_enabled", False)
+    merged["email_severity_threshold"] = site_settings["alerts"].get("email_severity_threshold", "high")
+
     return merged
 
 
