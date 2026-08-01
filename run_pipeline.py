@@ -235,6 +235,36 @@ def send_incident_email(incident: dict):
         print(f"  [WARN] Failed to send alert email: {e}")
 
 
+def build_detected_objects(result, extra_objects: list = None) -> list:
+    """
+    Builds the full list of everything detected this frame — every currently
+    tracked person (ByteTrack ID + bbox), plus any target-model object boxes
+    passed in via extra_objects (e.g. the spill/fire that triggered an
+    object_in_zone or person_near_object rule). Previously only the single
+    violator's bbox was ever stored on an incident; this is the foundation for
+    the Incident Inspector feature (click a person in the list -> highlight
+    them in the frame) — can't build that UI until this data actually exists.
+    """
+    detected = []
+    if result.boxes is not None and result.boxes.id is not None:
+        for box, tid in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.id.cpu().numpy()):
+            x1, y1, x2, y2 = box
+            detected.append({
+                "type": "person",
+                "track_id": int(tid),
+                "bbox": [round(float(x1), 1), round(float(y1), 1), round(float(x2), 1), round(float(y2), 1)],
+            })
+    if extra_objects:
+        for label, box in extra_objects:
+            x1, y1, x2, y2 = box
+            detected.append({
+                "type": label,
+                "track_id": None,
+                "bbox": [round(float(x1), 1), round(float(y1), 1), round(float(x2), 1), round(float(y2), 1)],
+            })
+    return detected
+
+
 def append_incident(incident: dict):
     if rule_id and site_id:
         try:
@@ -247,7 +277,7 @@ def append_incident(incident: dict):
                 frame_number=incident.get("frame"),
                 person_track_id=incident.get("person_id"),
                 violation_type=incident.get("violation"),
-                detected_objects=None,
+                detected_objects=incident.get("detected_objects"),
                 missing_gear=incident.get("missing_gear") or None,
                 zone=incident.get("zone"),
                 bbox=incident.get("bbox"),
@@ -393,7 +423,7 @@ active_violations = {}
 # streak_counters[key] = number of consecutive frames with violation
 streak_counters = {}
 
-video = camera_source if camera_source else 'mega_cctv.mp4'
+video = camera_source if camera_source else 'mega_cctv_v2.mp4'
 print(f"Processing {video} (camera_id={camera_id})...")
 
 # ── RTSP Phase 2: know whether this is a live stream (rtsp://) vs a finite file ──
@@ -516,6 +546,7 @@ try:
                         "alert_message":   config['alert']['message'],
                         "streak_frames":   current_streak,
                         "rule_db_id":      rule.get("rule_db_id"),
+                        "detected_objects": build_detected_objects(result, [(target, ob) for ob in hits]),
                     }
                     append_incident(incident)
                     print(f"Frame {frame_idx}: {target.upper()} | rule[{rule_idx}] object_in_zone in {zone_name}"
@@ -640,6 +671,7 @@ try:
                             "alert_message":   config['alert']['message'],
                             "streak_frames":   current_streak,
                             "rule_db_id":      rule.get("rule_db_id"),
+                            "detected_objects": build_detected_objects(result, [(target, ob) for ob in obj_boxes]),
                         }
                         append_incident(incident)
                         print(f"Frame {frame_idx}: person #{person_id} | rule[{rule_idx}] person_near_object "
@@ -721,6 +753,7 @@ try:
                         "alert_message":   config['alert']['message'],
                         "streak_frames":   current_streak,
                         "rule_db_id":      rule.get("rule_db_id"),
+                        "detected_objects": build_detected_objects(result),
                     }
                     append_incident(incident)
                     print(f"Frame {frame_idx}: rule[{rule_idx}] count_exceeded in {zone_name} "
@@ -844,6 +877,7 @@ try:
                             "alert_message":   config['alert']['message'],
                             "streak_frames":   current_streak,
                             "rule_db_id":      rule.get("rule_db_id"),
+                            "detected_objects": build_detected_objects(result),
                         }
 
                         append_incident(incident)

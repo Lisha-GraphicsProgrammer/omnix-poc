@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from collections import defaultdict
 import csv
+import difflib
 import io
 
 from db.session import get_db, SessionLocal
@@ -61,14 +62,14 @@ CONSECUTIVE_FAILURE_THRESHOLD = 10
 
 def _parse_source(src):
     if src is None:
-        return "mega_cctv.mp4"
+        return "mega_cctv_v2.mp4"
     try:
         return int(src)
     except (ValueError, TypeError):
         return str(src)
 
 
-VIDEO_SOURCE_DEFAULT = _parse_source(os.getenv("VIDEO_SOURCE", "mega_cctv.mp4"))
+VIDEO_SOURCE_DEFAULT = _parse_source(os.getenv("VIDEO_SOURCE", "mega_cctv_v2.mp4"))
 
 # ============================================================
 # SETTINGS — Task 3: DB-backed instead of in-memory dict
@@ -891,22 +892,88 @@ async def generate_rule(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def enrich_zone_coords(config: dict, db: Session, site_id: int) -> dict:
+def _normalize_zone_name(s: str) -> str:
+    return s.lower().replace("_", " ").replace("-", " ").strip()
+
+
+def enrich_zone_coords(config: dict, db: Session, site_id: int, camera_id: int = None) -> dict:
+    """
+    Replaces the LLM's guessed zone coordinates with the user's actual drawn
+    polygon, matched by name. Previously this was an exact-string-match only —
+    if the LLM said "loading_zone" and the user's real zone was named anything
+    even slightly different, this silently fell back to the LLM's tiny
+    template rectangle with zero warning, meaning the pipeline watches the
+    wrong area. This is the #1 silent-failure risk when a client tries a rule
+    live, so the fallback path now (a) tries harder to find the right zone via
+    single-zone-shortcut and fuzzy matching, and (b) never fails silently —
+    always logs loudly if no match was found. ──
+    """
     zones = config.get("zones", [])
     if not zones:
         return config
     try:
-        db_zones = {z.name: z.polygon for z in db.query(Zone).filter(Zone.site_id == site_id).all()}
+        q = db.query(Zone).filter(Zone.site_id == site_id)
+        if camera_id is not None:
+            q = q.filter(Zone.camera_id == camera_id)
+        db_zone_rows = q.all()
     except Exception as e:
         print(f"[OMNIX] Zone enrichment skipped (DB error): {e}")
         return config
+
+    if not db_zone_rows:
+        print(f"[OMNIX] WARNING: No user-drawn zones found for this camera — "
+              f"all rule zones will use LLM template coords (likely wrong area)")
+        return config
+
+    db_zones = {z.name: z.polygon for z in db_zone_rows}
+
     for zone in zones:
-        name = zone.get("name")
-        polygon = db_zones.get(name)
+        name = zone.get("name", "")
+        polygon = None
+        match_reason = None
+
+        # 1. Exact match — fast path, unchanged behavior when names already align
+        if name in db_zones:
+            polygon = db_zones[name]
+            match_reason = "exact match"
+
+        # 2. Single-zone camera: no ambiguity possible — if there's only one
+        # zone drawn on this camera, that's obviously what the rule means,
+        # regardless of what the LLM happened to name it.
+        elif len(db_zone_rows) == 1:
+            only_zone = db_zone_rows[0]
+            polygon = only_zone.polygon
+            match_reason = f"only zone on this camera (LLM said '{name}', actual zone is '{only_zone.name}')"
+
+        # 3. Multiple zones, no exact match — fuzzy match by normalized
+        # substring containment first, then similarity ratio as a fallback,
+        # so "loading_zone" still matches "Loading Zone Entrance" or similar.
+        else:
+            norm_target = _normalize_zone_name(name)
+            best_name = None
+            for db_name in db_zones:
+                norm_db_name = _normalize_zone_name(db_name)
+                if norm_target == norm_db_name or norm_target in norm_db_name or norm_db_name in norm_target:
+                    best_name = db_name
+                    break
+            if not best_name:
+                norm_to_original = {_normalize_zone_name(n): n for n in db_zones}
+                close = difflib.get_close_matches(norm_target, list(norm_to_original.keys()), n=1, cutoff=0.6)
+                if close:
+                    best_name = norm_to_original[close[0]]
+            if best_name:
+                polygon = db_zones[best_name]
+                match_reason = f"fuzzy match (LLM said '{name}', matched to '{best_name}')"
+
         if polygon and len(polygon) >= 3:
             zone["coords"] = polygon
             zone["source"] = "user_drawn"
-            print(f"[OMNIX] Zone '{name}': using user-drawn polygon ({len(polygon)} points)")
+            print(f"[OMNIX] Zone '{name}': using user-drawn polygon ({len(polygon)} points) — {match_reason}")
+        else:
+            print(f"[OMNIX] WARNING: Zone '{name}' has no matching user-drawn polygon "
+                  f"(available zones: {list(db_zones.keys())}) — falling back to LLM "
+                  f"template coords. This rule may be watching the WRONG AREA!")
+
     return config
 
 
@@ -949,8 +1016,20 @@ def rebuild_pipeline_config_from_db(db: Session, site_id: int) -> dict:
     for db_rule in active_rules[1:]:
         stamped_cfg = stamp(db_rule.config_json, db_rule.id)
         merged = merge_configs(merged, stamped_cfg)
-
     merged = enrich_zone_coords(merged, db, site_id)
+
+    # ── Fix per Hains' review (re-applied — this was lost in an earlier merge):
+    # apply_rule() injects these site-wide settings at apply time, but a
+    # rebuild-from-DB skipped this entirely, meaning a rebuild could silently
+    # turn email off even when Settings says on. Same injection now happens
+    # in both paths, using the same get_settings_for_site() source of truth. ──
+    site_settings = get_settings_for_site(db, site_id)
+    merged["persistence_frames"] = site_settings["detection"].get("persistence_frames", 5)
+    merged["alert_cooldown_frames"] = site_settings["detection"].get("alert_cooldown_frames", 150)
+    merged["detection_confidence"] = site_settings["detection"].get("detection_confidence", 0.5)
+    merged["email_notifications_enabled"] = site_settings["alerts"].get("email_notifications_enabled", False)
+    merged["email_severity_threshold"] = site_settings["alerts"].get("email_severity_threshold", "high")
+
     return merged
 
 
@@ -1038,7 +1117,7 @@ async def apply_rule(
             merged = merge_configs(existing_config, new_config)
         else:
             merged = new_config
-        merged = enrich_zone_coords(merged, db, current_user.site_id)
+        merged = enrich_zone_coords(merged, db, current_user.site_id, camera_id)
 
         # ── Task 3: inject site-wide settings into the pipeline config at apply time ──
         site_settings = get_settings_for_site(db, current_user.site_id)
