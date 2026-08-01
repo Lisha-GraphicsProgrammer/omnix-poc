@@ -850,11 +850,25 @@ async def generate_rule(
         if zone_names:
             zone_context = f"\n\nEXISTING ZONES: {', '.join(zone_names)}\nUse these zone names directly."
         full_prompt = f"{SYSTEM_PROMPT}{zone_context}\n\nUser instruction: {instruction}\n\nJSON output:"
-        response = requests.post(
-            OLLAMA_URL,
-            json={"model": OLLAMA_MODEL, "prompt": full_prompt, "stream": False, "format": "json", "options": {"temperature": 0.1, "num_predict": 1024}},
-            timeout=120
-        )
+
+        # ── Ollama resilience (demo-day insurance): a cold start — the model
+        # not yet loaded into VRAM — can take longer than a normal request.
+        # Retry once with a longer timeout before giving up, and return a
+        # clean, actionable message instead of a raw timeout error if it
+        # still fails. ──
+        ollama_payload = {"model": OLLAMA_MODEL, "prompt": full_prompt, "stream": False, "format": "json", "options": {"temperature": 0.1, "num_predict": 1024}}
+        try:
+            response = requests.post(OLLAMA_URL, json=ollama_payload, timeout=60)
+        except requests.exceptions.Timeout:
+            print(f"[OMNIX] Ollama timed out on first attempt (60s) — likely a cold start, retrying with a longer timeout...")
+            try:
+                response = requests.post(OLLAMA_URL, json=ollama_payload, timeout=180)
+            except requests.exceptions.Timeout:
+                raise HTTPException(
+                    status_code=503,
+                    detail="AI engine is warming up, please try again in ~30 seconds."
+                )
+
         if response.status_code != 200:
             raise HTTPException(status_code=500, detail=f"Ollama error: {response.text}")
         result = response.json()
@@ -888,9 +902,13 @@ async def generate_rule(
         raise HTTPException(status_code=503, detail="Ollama is not running. Start it with: ollama serve")
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=500, detail=f"LLM returned invalid JSON: {str(e)}. Raw: {response_text[:500]}")
+    except HTTPException:
+        # Let our own clean HTTPExceptions (400 above, 503 warming-up above)
+        # pass through unchanged — otherwise the catch-all below would wrap
+        # them into a generic mangled 500, defeating the point of this fix.
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 def _normalize_zone_name(s: str) -> str:
     return s.lower().replace("_", " ").replace("-", " ").strip()
