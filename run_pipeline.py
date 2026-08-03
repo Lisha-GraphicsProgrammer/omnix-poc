@@ -435,22 +435,23 @@ ORIG_H = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 _cap.release()
 print(f"[INFO] Original video resolution: {ORIG_W}x{ORIG_H}\n")
 
-# Scale user-drawn zone polygons from snapshot space (854x480) to native res
+# ── Issue #26 fix: zone coords are now stored normalized (0-1, relative to
+# frame size), so scaling to native resolution is a direct multiply — no more
+# assuming the drawing canvas was 854x480. SCALE_X/SCALE_Y below remain for
+# proximity_px only (person_near_object's threshold is still spec'd at 854x480,
+# a separate concern from zone placement). ──
 SNAP_W, SNAP_H = 854, 480
-# ── Part 2: person_near_object's proximity_px is specified at 854x480 (per spec) —
-# scale it to whatever the actual native video resolution is ──
 SCALE_X = (ORIG_W / SNAP_W) if ORIG_W else 1.0
 SCALE_Y = (ORIG_H / SNAP_H) if ORIG_H else 1.0
 PROXIMITY_SCALE = (SCALE_X + SCALE_Y) / 2
 for zn, zd in zones_map.items():
     if zd['source'] == 'user_drawn' and ORIG_W and ORIG_H:
-        sx, sy = ORIG_W / SNAP_W, ORIG_H / SNAP_H
-        zd['poly'] = [[p[0] * sx, p[1] * sy] for p in zd['coords']]
+        zd['poly'] = [[p[0] * ORIG_W, p[1] * ORIG_H] for p in zd['coords']]
         zd['x_min'] = min(p[0] for p in zd['poly'])
         zd['x_max'] = max(p[0] for p in zd['poly'])
         zd['y_min'] = min(p[1] for p in zd['poly'])
         zd['y_max'] = max(p[1] for p in zd['poly'])
-        print(f"[ZONE] '{zn}' user-drawn polygon scaled to native res ({len(zd['poly'])} points)")
+        print(f"[ZONE] '{zn}' normalized polygon scaled to native res ({len(zd['poly'])} points)")
     else:
         zd['poly'] = zd['coords']
 

@@ -850,15 +850,51 @@ async def generate_rule(
         if zone_names:
             zone_context = f"\n\nEXISTING ZONES: {', '.join(zone_names)}\nUse these zone names directly."
         full_prompt = f"{SYSTEM_PROMPT}{zone_context}\n\nUser instruction: {instruction}\n\nJSON output:"
-        response = requests.post(
-            OLLAMA_URL,
-            json={"model": OLLAMA_MODEL, "prompt": full_prompt, "stream": False, "format": "json", "options": {"temperature": 0.1, "num_predict": 1024}},
-            timeout=120
-        )
-        if response.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Ollama error: {response.text}")
-        result = response.json()
-        response_text = result.get("response", "").strip()
+
+        # ── Ollama resilience (demo-day insurance): a cold start — the model
+        # not yet loaded into VRAM — can take longer than a normal request.
+        # Retry once with a longer timeout before giving up, and return a
+        # clean, actionable message instead of a raw timeout error if it
+        # still fails. ──
+        ollama_payload = {"model": OLLAMA_MODEL, "prompt": full_prompt, "stream": False, "format": "json", "options": {"temperature": 0.1, "num_predict": 1024}}
+
+        def _is_unusable(text: str) -> bool:
+            # A dead/warming-up Ollama can return HTTP 200 with an empty body
+            # instead of erroring or timing out — treat that the same as a
+            # cold-start case so it goes through the warm-up retry instead of
+            # surfacing as a raw "invalid JSON" 500.
+            return not text or not text.strip()
+
+        response = None
+        response_text = ""
+        for attempt, timeout_s in enumerate((60, 180)):
+            try:
+                response = requests.post(OLLAMA_URL, json=ollama_payload, timeout=timeout_s)
+            except requests.exceptions.Timeout:
+                print(f"[OMNIX] Ollama timed out on attempt {attempt + 1} ({timeout_s}s) — retrying...")
+                response = None
+                continue
+
+            if response.status_code != 200:
+                raise HTTPException(status_code=500, detail=f"Ollama error: {response.text}")
+
+            result = response.json()
+            response_text = result.get("response", "").strip()
+            
+
+            if _is_unusable(response_text):
+                print(f"[OMNIX] Ollama returned an empty response on attempt {attempt + 1} — likely still warming up, retrying...")
+                response = None
+                continue
+
+            break  # got a usable response — stop retrying
+
+        if response is None:
+            raise HTTPException(
+                status_code=503,
+                detail="AI engine is warming up, please try again in ~30 seconds."
+            )
+
         if response_text.startswith("```"):
             response_text = response_text.split("```")[1]
             if response_text.startswith("json"):
@@ -888,9 +924,13 @@ async def generate_rule(
         raise HTTPException(status_code=503, detail="Ollama is not running. Start it with: ollama serve")
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=500, detail=f"LLM returned invalid JSON: {str(e)}. Raw: {response_text[:500]}")
+    except HTTPException:
+        # Let our own clean HTTPExceptions (400 above, 503 warming-up above)
+        # pass through unchanged — otherwise the catch-all below would wrap
+        # them into a generic mangled 500, defeating the point of this fix.
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 def _normalize_zone_name(s: str) -> str:
     return s.lower().replace("_", " ").replace("-", " ").strip()
