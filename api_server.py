@@ -857,22 +857,44 @@ async def generate_rule(
         # clean, actionable message instead of a raw timeout error if it
         # still fails. ──
         ollama_payload = {"model": OLLAMA_MODEL, "prompt": full_prompt, "stream": False, "format": "json", "options": {"temperature": 0.1, "num_predict": 1024}}
-        try:
-            response = requests.post(OLLAMA_URL, json=ollama_payload, timeout=60)
-        except requests.exceptions.Timeout:
-            print(f"[OMNIX] Ollama timed out on first attempt (60s) — likely a cold start, retrying with a longer timeout...")
-            try:
-                response = requests.post(OLLAMA_URL, json=ollama_payload, timeout=180)
-            except requests.exceptions.Timeout:
-                raise HTTPException(
-                    status_code=503,
-                    detail="AI engine is warming up, please try again in ~30 seconds."
-                )
 
-        if response.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Ollama error: {response.text}")
-        result = response.json()
-        response_text = result.get("response", "").strip()
+        def _is_unusable(text: str) -> bool:
+            # A dead/warming-up Ollama can return HTTP 200 with an empty body
+            # instead of erroring or timing out — treat that the same as a
+            # cold-start case so it goes through the warm-up retry instead of
+            # surfacing as a raw "invalid JSON" 500.
+            return not text or not text.strip()
+
+        response = None
+        response_text = ""
+        for attempt, timeout_s in enumerate((60, 180)):
+            try:
+                response = requests.post(OLLAMA_URL, json=ollama_payload, timeout=timeout_s)
+            except requests.exceptions.Timeout:
+                print(f"[OMNIX] Ollama timed out on attempt {attempt + 1} ({timeout_s}s) — retrying...")
+                response = None
+                continue
+
+            if response.status_code != 200:
+                raise HTTPException(status_code=500, detail=f"Ollama error: {response.text}")
+
+            result = response.json()
+            response_text = result.get("response", "").strip()
+            
+
+            if _is_unusable(response_text):
+                print(f"[OMNIX] Ollama returned an empty response on attempt {attempt + 1} — likely still warming up, retrying...")
+                response = None
+                continue
+
+            break  # got a usable response — stop retrying
+
+        if response is None:
+            raise HTTPException(
+                status_code=503,
+                detail="AI engine is warming up, please try again in ~30 seconds."
+            )
+
         if response_text.startswith("```"):
             response_text = response_text.split("```")[1]
             if response_text.startswith("json"):
