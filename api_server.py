@@ -675,6 +675,65 @@ async def review_incident(
     return {"status": "ok", "incident_id": incident_id, "review_status": review_status}
 
 
+# ── Incident Inspector: every tracked person + detected object for one
+# incident's frame, in the same coordinate space as the stored screenshot, so
+# the frontend can draw a box per entry directly over the image with no extra
+# scaling step beyond what BBoxOverlay already does for the violator bbox. ──
+@app.get("/api/incidents/{incident_id}/objects")
+def get_incident_objects(
+    incident_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    incident = db.query(Incident).filter(
+        Incident.id == incident_id,
+        Incident.site_id == current_user.site_id,
+    ).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    def _bbox_close(a, b, tol=0.6) -> bool:
+        # detected_objects bboxes are rounded to 1 decimal (build_detected_objects),
+        # while incident.bbox is stored unrounded — an exact equality check would
+        # silently miss the match, so compare with a small tolerance instead.
+        if not a or not b or len(a) < 4 or len(b) < 4:
+            return False
+        return all(abs(a[i] - b[i]) <= tol for i in range(4))
+
+    raw_objects = incident.detected_objects or []
+    objects = []
+    for obj in raw_objects:
+        if not obj or "bbox" not in obj:
+            continue
+        if incident.person_track_id is not None:
+            # person_near_object / count_exceeded style incidents: the
+            # violator is the tracked person matching the incident's own
+            # person_track_id.
+            is_violator = (
+                obj.get("type") == "person"
+                and obj.get("track_id") == incident.person_track_id
+            )
+        else:
+            # object_in_zone incidents have no person violator — the
+            # violator is the object whose bbox matches the one that
+            # actually triggered the incident (incident.bbox).
+            is_violator = _bbox_close(obj.get("bbox"), incident.bbox)
+        objects.append({
+            "type": obj.get("type"),
+            "track_id": obj.get("track_id"),
+            "bbox": obj.get("bbox"),
+            "confidence": obj.get("confidence"),
+            "is_violator": is_violator,
+        })
+
+    return {
+        "incident_id": incident_id,
+        "objects": objects,
+        "violator_bbox": incident.bbox,
+        "person_track_id": incident.person_track_id,
+    }
+
+
 # ── A: auth added ──
 # ── Task 2: manual rebuild trigger — useful for ops/testing without restarting
 # the whole backend, and to recover if the file gets corrupted/deleted mid-session ──
