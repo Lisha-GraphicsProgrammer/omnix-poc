@@ -247,20 +247,29 @@ def build_detected_objects(result, extra_objects: list = None) -> list:
     """
     detected = []
     if result.boxes is not None and result.boxes.id is not None:
-        for box, tid in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.id.cpu().numpy()):
+        # confidence sits in result.boxes.conf, parallel to .xyxy and .id
+        confs = result.boxes.conf.cpu().numpy() if result.boxes.conf is not None else None
+        for i, (box, tid) in enumerate(zip(result.boxes.xyxy.cpu().numpy(), result.boxes.id.cpu().numpy())):
             x1, y1, x2, y2 = box
             detected.append({
                 "type": "person",
                 "track_id": int(tid),
                 "bbox": [round(float(x1), 1), round(float(y1), 1), round(float(x2), 1), round(float(y2), 1)],
+                "confidence": round(float(confs[i]), 3) if confs is not None else None,
             })
     if extra_objects:
+        # TODO(fast-follow): confidence for object-type detections (spill,
+        # fire, etc.) isn't threaded through yet — hits/obj_boxes at the call
+        # sites only carry bbox arrays, and object_memory caches boxes across
+        # frames without confidence, so wiring this up safely needs a small
+        # refactor of the caching path rather than a quick change here.
         for label, box in extra_objects:
             x1, y1, x2, y2 = box
             detected.append({
                 "type": label,
                 "track_id": None,
                 "bbox": [round(float(x1), 1), round(float(y1), 1), round(float(x2), 1), round(float(y2), 1)],
+                "confidence": None,
             })
     return detected
 
