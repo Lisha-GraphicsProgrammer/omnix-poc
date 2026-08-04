@@ -733,6 +733,61 @@ def get_incident_objects(
         "person_track_id": incident.person_track_id,
     }
 
+# ============================================================
+# SELF-LEARNING — training jobs
+# ============================================================
+
+@app.get("/api/training-jobs")
+def list_training_jobs(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    from db.models import TrainingJob
+    jobs = db.query(TrainingJob).filter(
+        TrainingJob.site_id == current_user.site_id
+    ).order_by(TrainingJob.created_at.desc()).all()
+    return [
+        {
+            "id": j.id,
+            "class_name": j.class_name,
+            "status": j.status,
+            "current_stage": j.current_stage,
+            "stages": j.stages,
+            "metrics": j.metrics,
+            "error": j.error,
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+            "updated_at": j.updated_at.isoformat() if j.updated_at else None,
+        }
+        for j in jobs
+    ]
+
+
+@app.get("/api/training-jobs/{job_id}")
+def get_training_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    from db.models import TrainingJob
+    job = db.query(TrainingJob).filter(
+        TrainingJob.id == job_id,
+        TrainingJob.site_id == current_user.site_id
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Training job not found")
+    return {
+        "id": job.id,
+        "class_name": job.class_name,
+        "status": job.status,
+        "current_stage": job.current_stage,
+        "stages": job.stages,
+        "dataset_info": job.dataset_info,
+        "metrics": job.metrics,
+        "model_path": job.model_path,
+        "error": job.error,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+    }
 
 # ── A: auth added ──
 # ── Task 2: manual rebuild trigger — useful for ops/testing without restarting
@@ -879,6 +934,7 @@ OUTPUT FORMAT (must match exactly):
 }
 
 NOTE on optional rule fields: include "persistence_frames" only for urgent hazards (value 2); include "proximity_px" only on person_near_object rules; include "target" only on object_in_zone and person_near_object rules; include "count" only on count_exceeded rules. Omit fields that don't apply.
+If the instruction requires detecting an object class that is NOT in AVAILABLE MODELS (e.g. "trousers", "gloves", "ladder"), do NOT substitute a different model. Use the requested class name as the model key with weights path "runs/detect/<class>_model/weights/best.pt" and as the rule's target. The platform will train it.
 Only include models actually needed. Output ONLY the JSON. No markdown, no explanation."""
 
 
@@ -978,7 +1034,39 @@ async def generate_rule(
             if r.get("type") == "count_exceeded" and not r.get("count"):
                 r["count"] = 5
                 print(f"[OMNIX] Sanitizer: filled missing count=5 on count_exceeded rule")
-        return {"config": config, "instruction": instruction, "model_used": OLLAMA_MODEL, "provider": "ollama_local"}
+                # ── Self-learning hook: detect unknown classes and open training jobs ──
+        with open('model_registry.json', 'r') as f:
+            _registry = json.load(f)
+        _requested = set(config.get("models", {}).keys())
+        for r in config.get("rules", []):
+            if r.get("target"):
+                _requested.add(r["target"])
+        unknown_classes = sorted(c for c in _requested if c not in _registry)
+        training_jobs = []
+        if unknown_classes:
+            from db.models import TrainingJob
+            for cls in unknown_classes:
+                existing = db.query(TrainingJob).filter(
+                    TrainingJob.class_name == cls,
+                    TrainingJob.status.notin_(["failed", "cancelled"])
+                ).first()
+                if existing:
+                    training_jobs.append({"id": existing.id, "class_name": cls, "status": existing.status, "reused": True})
+                    continue
+                job = TrainingJob(
+                    site_id=current_user.site_id or 2,
+                    class_name=cls,
+                    status="pending",
+                    current_stage="queued",
+                    stages=[{"name": "queued", "status": "done"}],
+                )
+                db.add(job)
+                db.commit()
+                db.refresh(job)
+                training_jobs.append({"id": job.id, "class_name": cls, "status": "pending", "reused": False})
+                print(f"[OMNIX] Self-learning: unknown class '{cls}' → training job #{job.id} created")
+        return {"config": config, "instruction": instruction, "model_used": OLLAMA_MODEL,
+                "provider": "ollama_local", "unknown_classes": unknown_classes, "training_jobs": training_jobs}
     except requests.exceptions.ConnectionError:
         raise HTTPException(status_code=503, detail="Ollama is not running. Start it with: ollama serve")
     except json.JSONDecodeError as e:
