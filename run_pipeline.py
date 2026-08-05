@@ -258,18 +258,21 @@ def build_detected_objects(result, extra_objects: list = None) -> list:
                 "confidence": round(float(confs[i]), 3) if confs is not None else None,
             })
     if extra_objects:
-        # TODO(fast-follow): confidence for object-type detections (spill,
-        # fire, etc.) isn't threaded through yet — hits/obj_boxes at the call
-        # sites only carry bbox arrays, and object_memory caches boxes across
-        # frames without confidence, so wiring this up safely needs a small
-        # refactor of the caching path rather than a quick change here.
-        for label, box in extra_objects:
+        for item in extra_objects:
+            # (label, box, confidence) — confidence now threaded through from
+            # the object-detector's own conf array at each call site. Still
+            # accepts (label, box) 2-tuples for backward compatibility.
+            if len(item) == 3:
+                label, box, obj_conf = item
+            else:
+                label, box = item
+                obj_conf = None
             x1, y1, x2, y2 = box
             detected.append({
                 "type": label,
                 "track_id": None,
                 "bbox": [round(float(x1), 1), round(float(y1), 1), round(float(x2), 1), round(float(y2), 1)],
-                "confidence": None,
+                "confidence": round(float(obj_conf), 3) if obj_conf is not None else None,
             })
     return detected
 
@@ -506,12 +509,16 @@ try:
                 obj_results = models[target](result.orig_img, verbose=False, conf=conf)
 
             hits = []
+            hit_confs = []
             if obj_results[0].boxes is not None and len(obj_results[0].boxes) > 0:
-                for ob in obj_results[0].boxes.xyxy.cpu().numpy():
+                xyxy_arr = obj_results[0].boxes.xyxy.cpu().numpy()
+                conf_arr = obj_results[0].boxes.conf.cpu().numpy() if obj_results[0].boxes.conf is not None else None
+                for i, ob in enumerate(xyxy_arr):
                     ocx = (ob[0] + ob[2]) / 2
                     ocy = (ob[1] + ob[3]) / 2
                     if point_in_polygon(ocx, ocy, zone['poly']):
                         hits.append(ob)
+                        hit_confs.append(float(conf_arr[i]) if conf_arr is not None else None)
 
             if hits:
                 streak_counters[obj_key] = streak_counters.get(obj_key, 0) + 1
@@ -556,7 +563,7 @@ try:
                         "alert_message":   config['alert']['message'],
                         "streak_frames":   current_streak,
                         "rule_db_id":      rule.get("rule_db_id"),
-                        "detected_objects": build_detected_objects(result, [(target, ob) for ob in hits]),
+                        "detected_objects": build_detected_objects(result, [(target, ob, hit_confs[i]) for i, ob in enumerate(hits)]),
                     }
                     append_incident(incident)
                     print(f"Frame {frame_idx}: {target.upper()} | rule[{rule_idx}] object_in_zone in {zone_name}"
@@ -599,7 +606,11 @@ try:
 
             obj_boxes = []
             if obj_results[0].boxes is not None and len(obj_results[0].boxes) > 0:
-                obj_boxes = list(obj_results[0].boxes.xyxy.cpu().numpy())
+                xyxy_arr = obj_results[0].boxes.xyxy.cpu().numpy()
+                conf_arr = obj_results[0].boxes.conf.cpu().numpy() if obj_results[0].boxes.conf is not None else None
+                for i, box in enumerate(xyxy_arr):
+                    obj_conf = float(conf_arr[i]) if conf_arr is not None else None
+                    obj_boxes.append((box, obj_conf))
 
             # ── Occlusion fix: live detection refreshes memory; a dropout
             # within OBJECT_MEMORY_FRAMES falls back to the last-seen boxes
@@ -624,8 +635,9 @@ try:
 
                 # nearest-edge distance from person's bottom-center to each object bbox
                 nearest_obj = None
+                nearest_obj_conf = None
                 nearest_dist = float('inf')
-                for ob in obj_boxes:
+                for ob, oconf in obj_boxes:
                     ox1, oy1, ox2, oy2 = ob
                     dx = max(ox1 - person_center_x, 0, person_center_x - ox2)
                     dy = max(oy1 - person_bottom_y, 0, person_bottom_y - oy2)
@@ -633,6 +645,7 @@ try:
                     if dist < nearest_dist:
                         nearest_dist = dist
                         nearest_obj = ob
+                        nearest_obj_conf = oconf
 
                 if nearest_obj is not None and nearest_dist < proximity_px_native:
                     streak_counters[cooldown_key] = streak_counters.get(cooldown_key, 0) + 1
@@ -681,7 +694,7 @@ try:
                             "alert_message":   config['alert']['message'],
                             "streak_frames":   current_streak,
                             "rule_db_id":      rule.get("rule_db_id"),
-                            "detected_objects": build_detected_objects(result, [(target, ob) for ob in obj_boxes]),
+                            "detected_objects": build_detected_objects(result, [(target, ob, oconf) for ob, oconf in obj_boxes]),
                         }
                         append_incident(incident)
                         print(f"Frame {frame_idx}: person #{person_id} | rule[{rule_idx}] person_near_object "
