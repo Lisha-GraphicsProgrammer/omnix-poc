@@ -789,6 +789,75 @@ def get_training_job(
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
     }
 
+@app.post("/api/training-jobs/{job_id}/approve")
+def approve_training_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can approve model training")
+    from db.models import TrainingJob
+    job = db.query(TrainingJob).filter(
+        TrainingJob.id == job_id,
+        TrainingJob.site_id == current_user.site_id
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Training job not found")
+    if job.current_stage != "awaiting_approval":
+        raise HTTPException(status_code=400, detail=f"Job is at stage '{job.current_stage}', not ready for approval")
+
+    # Register the newly-trained model into the live registry so the
+    # pipeline can actually use it for detection.
+    with open('model_registry.json', 'r') as f:
+        registry = json.load(f)
+    registry[job.class_name] = {
+        "type": "custom",
+        "weights": job.model_path,
+        "confidence": job.metrics.get("precision", 0.5) if job.metrics else 0.5,
+        "conf_threshold": 0.5,
+    }
+    with open('model_registry.json', 'w') as f:
+        json.dump(registry, f, indent=2)
+
+    job.status = "approved"
+    stages = list(job.stages or [])
+    stages.append({"name": "approved", "status": "done", "detail": f"Approved by {current_user.name or current_user.email}"})
+    job.stages = stages
+    job.current_stage = "approved"
+    db.commit()
+
+    return {
+        "status": "approved",
+        "class_name": job.class_name,
+        "registered_weights": job.model_path,
+        "message": f"'{job.class_name}' is now a live detection capability."
+    }
+
+
+@app.post("/api/training-jobs/{job_id}/reject")
+def reject_training_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can reject model training")
+    from db.models import TrainingJob
+    job = db.query(TrainingJob).filter(
+        TrainingJob.id == job_id,
+        TrainingJob.site_id == current_user.site_id
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Training job not found")
+
+    job.status = "cancelled"
+    stages = list(job.stages or [])
+    stages.append({"name": "rejected", "status": "done", "detail": f"Rejected by {current_user.name or current_user.email}"})
+    job.stages = stages
+    db.commit()
+    return {"status": "rejected", "class_name": job.class_name}
+
 # ── A: auth added ──
 # ── Task 2: manual rebuild trigger — useful for ops/testing without restarting
 # the whole backend, and to recover if the file gets corrupted/deleted mid-session ──

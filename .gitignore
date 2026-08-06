@@ -39,3 +39,8 @@ runs/detect/*/args.yaml
 runs/detect/*/results.csv
 test_summary.json
 test_frame_*.jpg
+
+# Self-learning pipeline (new datasets/models — never commit these)
+datasets/
+runs/self_learning/
+body.json
