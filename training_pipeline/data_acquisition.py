@@ -18,6 +18,7 @@ load_dotenv()
 DATASETS_DIR = Path("datasets")
 UNIVERSE_SEARCH_URL = "https://api.roboflow.com/universe/search"
 
+
 def search_universe(class_name: str, min_images: int = 50) -> list[dict]:
     """
     Live search against Roboflow Universe for datasets matching class_name.
@@ -66,8 +67,20 @@ def search_universe(class_name: str, min_images: int = 50) -> list[dict]:
             "url": dataset_url,
         })
 
-    candidates.sort(key=lambda c: (c["images"], c["stars"]), reverse=True)
+    # Prefer datasets in a practical size range for fast iteration (a few
+    # hundred to a few thousand images) over raw maximum size. A 900-image
+    # curated set trains and verifies in minutes; a 100k-image general
+    # dataset (e.g. full COCO) can take an hour just to verify on CPU,
+    # which defeats the purpose of a fast self-learning proof-of-concept.
+    # Closest-to-3000 wins ties broken by stars (community trust signal).
+    def rank_score(c):
+        images = c["images"]
+        size_score = -abs(images - 3000)
+        return (size_score, c["stars"])
+
+    candidates.sort(key=rank_score, reverse=True)
     return candidates
+
 
 def acquire_dataset(class_name: str) -> dict:
     """
@@ -97,6 +110,9 @@ def acquire_dataset(class_name: str) -> dict:
             project.version(ver).download("yolov8", location=str(DATASETS_DIR / class_name))
             img_dir = DATASETS_DIR / class_name / "train" / "images"
             image_count = sum(1 for _ in img_dir.glob("*")) if img_dir.exists() else 0
+            if image_count == 0:
+                last_error = f"{ws}/{proj} downloaded but produced 0 images (likely a partial/failed download)"
+                continue
             return {
                 "success": True,
                 "path": str(DATASETS_DIR / class_name),
