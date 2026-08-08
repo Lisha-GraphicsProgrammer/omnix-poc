@@ -31,12 +31,10 @@ from sqlalchemy import func
 
 load_dotenv()
 
-# ── B3: Read PUBLIC_BASE_URL from env ──
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
 
 app = FastAPI(title="OMNIX POC API")
 
-# ── B1: CORS from env variable ──
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173")
 ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
@@ -55,7 +53,6 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 
 ZONE_COLORS = ["#00D4FF", "#00E676", "#FFB300", "#7C3AED", "#FF4444", "#FF6B6B", "#818cf8", "#f472b6"]
 
-# ── RTSP Phase 2: reconnect tuning ──
 RECONNECT_INTERVAL_SECONDS = 5
 CONSECUTIVE_FAILURE_THRESHOLD = 10
 
@@ -71,10 +68,6 @@ def _parse_source(src):
 
 VIDEO_SOURCE_DEFAULT = _parse_source(os.getenv("VIDEO_SOURCE", "mega_cctv_v2.mp4"))
 
-# ============================================================
-# SETTINGS — Task 3: DB-backed instead of in-memory dict
-# ============================================================
-
 DEFAULT_SETTINGS = {
     "detection": {"alert_cooldown_frames": 150, "detection_confidence": 0.5, "bytetrack_buffer": 30, "persistence_frames": 5},
     "alerts": {"channels": "dashboard", "deduplication_enabled": True, "email_notifications_enabled": False, "email_severity_threshold": "high"},
@@ -84,8 +77,7 @@ DEFAULT_SETTINGS = {
 
 
 def get_settings_for_site(db: Session, site_id: int) -> dict:
-    """DB-backed settings, merged over defaults. Settings are stored one row per section (site-wide, not per-user)."""
-    settings = json.loads(json.dumps(DEFAULT_SETTINGS))  # deep copy
+    settings = json.loads(json.dumps(DEFAULT_SETTINGS))
     rows = db.query(Setting).filter(Setting.site_id == site_id, Setting.user_id.is_(None)).all()
     for row in rows:
         if row.key in settings and isinstance(row.value, dict):
@@ -112,10 +104,6 @@ def save_settings_for_site(db: Session, site_id: int, updates: dict):
 _pipeline_process = None
 
 
-# ============================================================
-# VIDEO STREAMING — per-camera dict (RTSP Phase 1) + reconnect (Phase 2)
-# ============================================================
-
 class VideoStream:
     def __init__(self):
         self.cap = None
@@ -126,7 +114,7 @@ class VideoStream:
         self.width = 0
         self.height = 0
         self.source = None
-        self.is_live = False  # True for rtsp:// or webcam index; False for local files
+        self.is_live = False
         self._consecutive_failures = 0
 
     def start(self, source):
@@ -154,8 +142,6 @@ class VideoStream:
             ret, frame = self.cap.read()
             if not ret:
                 if self.is_live:
-                    # Live source (RTSP/webcam): looping to frame 0 is meaningless here.
-                    # Track consecutive failures instead of retrying immediately.
                     self._consecutive_failures += 1
                     if self._consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD:
                         print(f"[OMNIX] Stream dead after {self._consecutive_failures} consecutive failed reads: {self.source}")
@@ -165,7 +151,6 @@ class VideoStream:
                             self.cap = None
                     return None
                 else:
-                    # Local file: loop back to start (unchanged existing behavior)
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     ret, frame = self.cap.read()
             if ret:
@@ -182,17 +167,11 @@ class VideoStream:
                 self.cap = None
 
 
-# camera_id -> VideoStream. Replaces the old single global `video_stream`.
 video_streams: dict[int, VideoStream] = {}
 _video_streams_lock = threading.Lock()
 
 
 def _camera_source_for(camera_id: int, db: Session):
-    """
-    Resolve the actual source to open for a camera.
-    DB source wins. Camera 1 falls back to VIDEO_SOURCE_DEFAULT (.env) if the
-    DB source is unset/placeholder, so existing dev setups keep working unchanged.
-    """
     cam = db.query(CameraModel).filter(CameraModel.id == camera_id).first()
     if cam and cam.source and cam.source != "default":
         return _parse_source(cam.source)
@@ -202,7 +181,6 @@ def _camera_source_for(camera_id: int, db: Session):
 
 
 def get_or_start_stream(camera_id: int, db: Session):
-    """Returns a running VideoStream for camera_id, starting one if needed. None if source can't be resolved/opened."""
     with _video_streams_lock:
         vs = video_streams.get(camera_id)
         if vs is not None and vs.running:
@@ -218,7 +196,6 @@ def get_or_start_stream(camera_id: int, db: Session):
 
 
 def restart_stream(camera_id: int, db: Session):
-    """Force-stop and reopen a camera's stream (used after its source changes)."""
     with _video_streams_lock:
         old = video_streams.pop(camera_id, None)
         if old:
@@ -227,8 +204,6 @@ def restart_stream(camera_id: int, db: Session):
 
 
 def _reconnect_monitor():
-    """Background loop: checks for dead streams every RECONNECT_INTERVAL_SECONDS
-    and attempts to reconnect them, updating each camera's DB status along the way."""
     while True:
         time.sleep(RECONNECT_INTERVAL_SECONDS)
         db = SessionLocal()
@@ -266,10 +241,6 @@ def on_startup():
             print(f"[OMNIX] Camera {cam.id} ({cam.name}): {'started' if vs else 'offline'} — source={cam.source}")
         db.commit()
 
-        # ── Task 2: fresh-deploy safety net — if pipeline_config.json is missing
-        # (new box, or accidentally deleted) but the DB already has active rules,
-        # rebuild the file from DB state instead of leaving the pipeline blind
-        # to rules that were already configured on a previous deploy. ──
         config_path = Path("pipeline_config.json")
         if not config_path.exists():
             site = db.query(Site).first()
@@ -286,10 +257,6 @@ def on_startup():
     threading.Thread(target=_reconnect_monitor, daemon=True).start()
     print(f"[OMNIX] Reconnect monitor started (checks every {RECONNECT_INTERVAL_SECONDS}s)")
 
-
-# ============================================================
-# AUTH ENDPOINTS
-# ============================================================
 
 class LoginRequest(BaseModel):
     email: str
@@ -353,10 +320,6 @@ def me(current_user: User = Depends(get_current_user)):
     }
 
 
-# ============================================================
-# USER MANAGEMENT
-# ============================================================
-
 @app.post("/api/users/invite")
 async def invite_user(
     request: Request,
@@ -408,10 +371,6 @@ def get_users(
         for u in users
     ]
 
-
-# ============================================================
-# ZONES
-# ============================================================
 
 @app.get("/api/zones")
 def get_zones(
@@ -542,10 +501,6 @@ def delete_zone(
     return {"status": "deleted", "zone_id": zone_id}
 
 
-# ============================================================
-# CORE ENDPOINTS
-# ============================================================
-
 @app.get("/")
 def root():
     return {"status": "OMNIX POC API running", "llm_provider": "ollama", "model": OLLAMA_MODEL}
@@ -559,9 +514,9 @@ def get_incidents(
     camera_id: int = None,
     violation: str = None,
     severity: str = None,
-    review: str = None,          # "unreviewed" | "reviewed" | "false_positive" | "dismissed"
-    date_from: str = None,       # ISO date e.g. 2026-07-19
-    date_to: str = None,         # ISO date (inclusive)
+    review: str = None,
+    date_from: str = None,
+    date_to: str = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -569,7 +524,6 @@ def get_incidents(
     offset = max(0, offset)
     try:
         base_q = db.query(Incident).filter(Incident.site_id == current_user.site_id)
-        # ── Alert usability: server-side filters ──
         if rule_id is not None:
             base_q = base_q.filter(Incident.rule_id == rule_id)
         if camera_id is not None:
@@ -599,7 +553,6 @@ def get_incidents(
                 base_q.order_by(Incident.timestamp.desc())
                 .offset(offset).limit(limit).all()
             )
-            # ── Alert usability: attach the plain-English rule that fired ──
             rule_ids = {inc.rule_id for inc in incidents if inc.rule_id}
             rule_map = {}
             if rule_ids:
@@ -675,10 +628,6 @@ async def review_incident(
     return {"status": "ok", "incident_id": incident_id, "review_status": review_status}
 
 
-# ── Incident Inspector: every tracked person + detected object for one
-# incident's frame, in the same coordinate space as the stored screenshot, so
-# the frontend can draw a box per entry directly over the image with no extra
-# scaling step beyond what BBoxOverlay already does for the violator bbox. ──
 @app.get("/api/incidents/{incident_id}/objects")
 def get_incident_objects(
     incident_id: int,
@@ -693,9 +642,6 @@ def get_incident_objects(
         raise HTTPException(status_code=404, detail="Incident not found")
 
     def _bbox_close(a, b, tol=0.6) -> bool:
-        # detected_objects bboxes are rounded to 1 decimal (build_detected_objects),
-        # while incident.bbox is stored unrounded — an exact equality check would
-        # silently miss the match, so compare with a small tolerance instead.
         if not a or not b or len(a) < 4 or len(b) < 4:
             return False
         return all(abs(a[i] - b[i]) <= tol for i in range(4))
@@ -706,17 +652,11 @@ def get_incident_objects(
         if not obj or "bbox" not in obj:
             continue
         if incident.person_track_id is not None:
-            # person_near_object / count_exceeded style incidents: the
-            # violator is the tracked person matching the incident's own
-            # person_track_id.
             is_violator = (
                 obj.get("type") == "person"
                 and obj.get("track_id") == incident.person_track_id
             )
         else:
-            # object_in_zone incidents have no person violator — the
-            # violator is the object whose bbox matches the one that
-            # actually triggered the incident (incident.bbox).
             is_violator = _bbox_close(obj.get("bbox"), incident.bbox)
         objects.append({
             "type": obj.get("type"),
@@ -733,9 +673,67 @@ def get_incident_objects(
         "person_track_id": incident.person_track_id,
     }
 
-# ============================================================
-# SELF-LEARNING — training jobs
-# ============================================================
+
+# ── Incident Inspector map view: every zone polygon (already normalized 0-1
+# relative to each camera's own frame) plus a normalized center-point for
+# every incident's bbox, so the frontend can draw both in the same 2D space
+# without needing to know about camera resolution at all. ──
+@app.get("/api/incidents/map")
+def get_incidents_map(
+    limit: int = 200,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    zones = db.query(Zone).filter(Zone.site_id == current_user.site_id).all()
+    zone_list = [
+        {
+            "id": z.id,
+            "name": z.name,
+            "polygon": z.polygon,
+            "color": z.color,
+            "camera_id": z.camera_id,
+        }
+        for z in zones
+    ]
+
+    incidents = (
+        db.query(Incident)
+        .filter(Incident.site_id == current_user.site_id, Incident.bbox.isnot(None))
+        .order_by(Incident.timestamp.desc())
+        .limit(limit)
+        .all()
+    )
+
+    incident_list = []
+    for inc in incidents:
+        if not inc.bbox or len(inc.bbox) < 4:
+            continue
+        cam_id = inc.camera_id or 1
+        # ── prefer a camera's real live resolution (tracked by its running
+        # VideoStream) over the DB's resolution field, which isn't always
+        # populated; fall back to 854x480 — the same canvas zone polygons
+        # are already normalized against — if neither is available. ──
+        vs = video_streams.get(cam_id)
+        if vs and vs.width and vs.height:
+            res_w, res_h = vs.width, vs.height
+        else:
+            res_w, res_h = 854, 480
+        x1, y1, x2, y2 = inc.bbox[:4]
+        cx = ((x1 + x2) / 2) / res_w
+        cy = ((y1 + y2) / 2) / res_h
+        incident_list.append({
+            "id": inc.id,
+            "camera_id": cam_id,
+            "zone": inc.zone,
+            "severity": inc.severity,
+            "violation": inc.violation_type,
+            "timestamp": inc.timestamp.isoformat() if inc.timestamp else None,
+            "x": round(max(0, min(1, cx)), 4),
+            "y": round(max(0, min(1, cy)), 4),
+        })
+
+    return {"zones": zone_list, "incidents": incident_list}
+
 
 @app.get("/api/training-jobs")
 def list_training_jobs(
@@ -807,8 +805,6 @@ def approve_training_job(
     if job.current_stage != "awaiting_approval":
         raise HTTPException(status_code=400, detail=f"Job is at stage '{job.current_stage}', not ready for approval")
 
-    # Register the newly-trained model into the live registry so the
-    # pipeline can actually use it for detection.
     with open('model_registry.json', 'r') as f:
         registry = json.load(f)
     registry[job.class_name] = {
@@ -858,9 +854,6 @@ def reject_training_job(
     db.commit()
     return {"status": "rejected", "class_name": job.class_name}
 
-# ── A: auth added ──
-# ── Task 2: manual rebuild trigger — useful for ops/testing without restarting
-# the whole backend, and to recover if the file gets corrupted/deleted mid-session ──
 @app.post("/api/pipeline/rebuild")
 def rebuild_pipeline_config(
     db: Session = Depends(get_db),
@@ -910,10 +903,6 @@ def get_stats(
         "zones_affected": list(set(i["zone"] for i in incidents))
     }
 
-
-# ============================================================
-# RULES
-# ============================================================
 
 @app.get("/api/rules")
 def get_rules(
@@ -965,10 +954,6 @@ def delete_rule(
     return {"status": "deleted", "rule_id": rule_id}
 
 
-# ============================================================
-# LLM RULE GENERATION
-# ============================================================
-
 SYSTEM_PROMPT = """You are OMNIX's rule generator. Convert plain English safety instructions into valid pipeline_config.json for a YOLOv8 + ByteTrack computer vision pipeline.
 
 AVAILABLE MODELS:
@@ -1007,7 +992,6 @@ If the instruction requires detecting an object class that is NOT in AVAILABLE M
 Only include models actually needed. Output ONLY the JSON. No markdown, no explanation."""
 
 
-# ── A: auth added ──
 @app.post("/api/rules/generate")
 async def generate_rule(
     request: Request,
@@ -1035,18 +1019,9 @@ async def generate_rule(
             zone_context = f"\n\nEXISTING ZONES: {', '.join(zone_names)}\nUse these zone names directly."
         full_prompt = f"{SYSTEM_PROMPT}{zone_context}\n\nUser instruction: {instruction}\n\nJSON output:"
 
-        # ── Ollama resilience (demo-day insurance): a cold start — the model
-        # not yet loaded into VRAM — can take longer than a normal request.
-        # Retry once with a longer timeout before giving up, and return a
-        # clean, actionable message instead of a raw timeout error if it
-        # still fails. ──
         ollama_payload = {"model": OLLAMA_MODEL, "prompt": full_prompt, "stream": False, "format": "json", "options": {"temperature": 0.1, "num_predict": 1024}}
 
         def _is_unusable(text: str) -> bool:
-            # A dead/warming-up Ollama can return HTTP 200 with an empty body
-            # instead of erroring or timing out — treat that the same as a
-            # cold-start case so it goes through the warm-up retry instead of
-            # surfacing as a raw "invalid JSON" 500.
             return not text or not text.strip()
 
         response = None
@@ -1064,14 +1039,13 @@ async def generate_rule(
 
             result = response.json()
             response_text = result.get("response", "").strip()
-            
 
             if _is_unusable(response_text):
                 print(f"[OMNIX] Ollama returned an empty response on attempt {attempt + 1} — likely still warming up, retrying...")
                 response = None
                 continue
 
-            break  # got a usable response — stop retrying
+            break
 
         if response is None:
             raise HTTPException(
@@ -1085,8 +1059,6 @@ async def generate_rule(
                 response_text = response_text[4:]
             response_text = response_text.strip()
         config = json.loads(response_text)
-        # ── Sanitizer: object_in_zone AND person_near_object rules must carry a
-        # target; if the LLM forgot, infer it from the models it selected. ──
         model_keys = [m for m in config.get("models", {}).keys() if m != "person"]
         for r in config.get("rules", []):
             if r.get("type") in ("object_in_zone", "person_near_object") and not r.get("target"):
@@ -1095,15 +1067,11 @@ async def generate_rule(
                 elif model_keys:
                     r["target"] = model_keys[0]
                     print(f"[OMNIX] Sanitizer: filled missing target='{model_keys[0]}' on {r.get('type')} rule")
-            # person_near_object without proximity_px gets the spec's default (854x480-relative, scaled by the pipeline)
             if r.get("type") == "person_near_object" and not r.get("proximity_px"):
                 r["proximity_px"] = 120
-            # count_exceeded without a count threshold gets a sensible default — the
-            # pipeline also defaults to 5 if this is somehow still missing at runtime
             if r.get("type") == "count_exceeded" and not r.get("count"):
                 r["count"] = 5
                 print(f"[OMNIX] Sanitizer: filled missing count=5 on count_exceeded rule")
-                # ── Self-learning hook: detect unknown classes and open training jobs ──
         with open('model_registry.json', 'r') as f:
             _registry = json.load(f)
         _requested = set(config.get("models", {}).keys())
@@ -1141,9 +1109,6 @@ async def generate_rule(
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=500, detail=f"LLM returned invalid JSON: {str(e)}. Raw: {response_text[:500]}")
     except HTTPException:
-        # Let our own clean HTTPExceptions (400 above, 503 warming-up above)
-        # pass through unchanged — otherwise the catch-all below would wrap
-        # them into a generic mangled 500, defeating the point of this fix.
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1153,17 +1118,6 @@ def _normalize_zone_name(s: str) -> str:
 
 
 def enrich_zone_coords(config: dict, db: Session, site_id: int, camera_id: int = None) -> dict:
-    """
-    Replaces the LLM's guessed zone coordinates with the user's actual drawn
-    polygon, matched by name. Previously this was an exact-string-match only —
-    if the LLM said "loading_zone" and the user's real zone was named anything
-    even slightly different, this silently fell back to the LLM's tiny
-    template rectangle with zero warning, meaning the pipeline watches the
-    wrong area. This is the #1 silent-failure risk when a client tries a rule
-    live, so the fallback path now (a) tries harder to find the right zone via
-    single-zone-shortcut and fuzzy matching, and (b) never fails silently —
-    always logs loudly if no match was found. ──
-    """
     zones = config.get("zones", [])
     if not zones:
         return config
@@ -1188,22 +1142,15 @@ def enrich_zone_coords(config: dict, db: Session, site_id: int, camera_id: int =
         polygon = None
         match_reason = None
 
-        # 1. Exact match — fast path, unchanged behavior when names already align
         if name in db_zones:
             polygon = db_zones[name]
             match_reason = "exact match"
 
-        # 2. Single-zone camera: no ambiguity possible — if there's only one
-        # zone drawn on this camera, that's obviously what the rule means,
-        # regardless of what the LLM happened to name it.
         elif len(db_zone_rows) == 1:
             only_zone = db_zone_rows[0]
             polygon = only_zone.polygon
             match_reason = f"only zone on this camera (LLM said '{name}', actual zone is '{only_zone.name}')"
 
-        # 3. Multiple zones, no exact match — fuzzy match by normalized
-        # substring containment first, then similarity ratio as a fallback,
-        # so "loading_zone" still matches "Loading Zone Entrance" or similar.
         else:
             norm_target = _normalize_zone_name(name)
             best_name = None
@@ -1234,14 +1181,6 @@ def enrich_zone_coords(config: dict, db: Session, site_id: int, camera_id: int =
 
 
 def rebuild_pipeline_config_from_db(db: Session, site_id: int) -> dict:
-    """
-    Rebuilds pipeline_config.json purely from the currently-active Rule rows in
-    the DB, folding them together with the same merge_configs() logic apply_rule
-    already uses incrementally. This lets a fresh deploy (no existing
-    pipeline_config.json on disk, or one that was wiped/lost) reconstruct the
-    full active-rules state, instead of the pipeline only ever reflecting
-    whichever single rule happens to be applied next.
-    """
     active_rules = db.query(Rule).filter(
         Rule.site_id == site_id,
         Rule.status == "active",
@@ -1259,10 +1198,6 @@ def rebuild_pipeline_config_from_db(db: Session, site_id: int) -> dict:
         }
 
     def stamp(cfg: dict, rule_db_id: int) -> dict:
-        # Deep copy so we never mutate the SQLAlchemy-tracked dict in place —
-        # re-stamp rule_db_id from the authoritative Rule.id at rebuild time,
-        # since the original apply-time stamping (mutating after db.commit())
-        # isn't guaranteed to have actually persisted to the JSON column.
         cfg = json.loads(json.dumps(cfg))
         for r in cfg.get("rules", []):
             r["rule_db_id"] = rule_db_id
@@ -1274,11 +1209,6 @@ def rebuild_pipeline_config_from_db(db: Session, site_id: int) -> dict:
         merged = merge_configs(merged, stamped_cfg)
     merged = enrich_zone_coords(merged, db, site_id)
 
-    # ── Fix per Hains' review (re-applied — this was lost in an earlier merge):
-    # apply_rule() injects these site-wide settings at apply time, but a
-    # rebuild-from-DB skipped this entirely, meaning a rebuild could silently
-    # turn email off even when Settings says on. Same injection now happens
-    # in both paths, using the same get_settings_for_site() source of truth. ──
     site_settings = get_settings_for_site(db, site_id)
     merged["persistence_frames"] = site_settings["detection"].get("persistence_frames", 5)
     merged["alert_cooldown_frames"] = site_settings["detection"].get("alert_cooldown_frames", 150)
@@ -1330,15 +1260,12 @@ async def apply_rule(
         new_config = body.get("config")
         instruction = body.get("instruction", "")
         force_overwrite = body.get("overwrite", False)
-        # ── RTSP Phase 1: which camera this rule/pipeline run applies to ──
         camera_id = int(body.get("camera_id") or 1)
         if not new_config:
             raise HTTPException(status_code=400, detail="config is required")
         if current_user.role != "admin":
             raise HTTPException(status_code=403, detail="Viewers cannot apply rules")
         try:
-            # ── Rule dedupe: re-applying the same instruction replaces the old
-            # row instead of stacking identical active rules forever. ──
             dupes = db.query(Rule).filter(
                 Rule.site_id == current_user.site_id,
                 Rule.status == "active",
@@ -1357,7 +1284,6 @@ async def apply_rule(
             db.add(rule)
             db.commit()
             db.refresh(rule)
-            # ── stamp each new rule with its DB id so incidents attribute correctly ──
             for r in new_config.get("rules", []):
                 r["rule_db_id"] = rule.id
         except Exception as e:
@@ -1375,12 +1301,10 @@ async def apply_rule(
             merged = new_config
         merged = enrich_zone_coords(merged, db, current_user.site_id, camera_id)
 
-        # ── Task 3: inject site-wide settings into the pipeline config at apply time ──
         site_settings = get_settings_for_site(db, current_user.site_id)
         merged["persistence_frames"] = site_settings["detection"].get("persistence_frames", 5)
         merged["alert_cooldown_frames"] = site_settings["detection"].get("alert_cooldown_frames", 150)
         merged["detection_confidence"] = site_settings["detection"].get("detection_confidence", 0.5)
-        # ── Task C fold-in: email notification settings, same "one config, pipeline reads it" pattern ──
         merged["email_notifications_enabled"] = site_settings["alerts"].get("email_notifications_enabled", False)
         merged["email_severity_threshold"] = site_settings["alerts"].get("email_severity_threshold", "high")
 
@@ -1395,7 +1319,6 @@ async def apply_rule(
         incidents_file = Path("incidents.json")
         if incidents_file.exists():
             incidents_file.unlink()
-        # ── RTSP Phase 1: pass the real camera_id through to run_pipeline.py ──
         _pipeline_process = subprocess.Popen(
             [sys.executable, "run_pipeline.py", "--camera_id", str(camera_id)],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
@@ -1421,8 +1344,6 @@ def reset_rules(
 ):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Viewers cannot reset rules")
-    # ── Real reset: deactivate the DB rules too, not just the config file.
-    # (Previously rules stayed "active" in the DB and re-accumulated.) ──
     deactivated = db.query(Rule).filter(
         Rule.site_id == current_user.site_id,
         Rule.status == "active",
@@ -1437,7 +1358,6 @@ def reset_rules(
     return {"status": "reset", "message": f"Pipeline config cleared, {deactivated} rule(s) deactivated."}
 
 
-# ── A: auth added ──
 @app.get("/api/pipeline/status")
 def pipeline_status(current_user: User = Depends(get_current_user)):
     global _pipeline_process
@@ -1449,7 +1369,6 @@ def pipeline_status(current_user: User = Depends(get_current_user)):
     return {"running": False, "pid": _pipeline_process.pid, "status": "finished", "exit_code": poll}
 
 
-# ── A: auth + admin added ──
 @app.post("/api/pipeline/stop")
 def stop_pipeline(current_user: User = Depends(get_current_user)):
     if current_user.role != "admin":
@@ -1464,10 +1383,6 @@ def stop_pipeline(current_user: User = Depends(get_current_user)):
         _pipeline_process.kill()
     return {"status": "stopped", "pid": _pipeline_process.pid}
 
-
-# ============================================================
-# VIDEO STREAMING — endpoints (per-camera)
-# ============================================================
 
 def generate_frames(camera_id: int):
     target_fps = 25
@@ -1525,7 +1440,6 @@ def video_snapshot(camera_id: int = 1, db: Session = Depends(get_db)):
     return Response(content=buffer.tobytes(), media_type="image/jpeg")
 
 
-# ── A: auth + admin added. Now per-camera; camera_id defaults to 1 for back-compat ──
 @app.post("/api/video/source")
 async def set_video_source(
     request: Request,
@@ -1554,10 +1468,6 @@ async def set_video_source(
     return {"status": "ok", "source": str(source), "fps": vs.fps, "camera_id": camera_id}
 
 
-# ============================================================
-# CAMERAS — reads from DB, per-camera live status
-# ============================================================
-
 class CameraCreateRequest(BaseModel):
     name: str
     location: str = ""
@@ -1577,13 +1487,12 @@ def _validate_source(source: str) -> str:
     if source.startswith("rtsp://"):
         return source
     if source.isdigit():
-        return source  # webcam index — validated on actual open attempt
+        return source
     if not Path(source).exists():
         raise HTTPException(status_code=404, detail=f"File not found: {source}")
     return source
 
 
-# ── A: auth added, C1: reads from DB, now per-camera live status ──
 @app.get("/api/cameras")
 def get_cameras(
     db: Session = Depends(get_db),
@@ -1690,10 +1599,6 @@ def update_camera(
     }
 
 
-# ============================================================
-# SETTINGS
-# ============================================================
-
 @app.get("/api/settings")
 def get_settings(
     db: Session = Depends(get_db),
@@ -1702,7 +1607,6 @@ def get_settings(
     return get_settings_for_site(db, current_user.site_id)
 
 
-# ── A: auth + admin added ──
 @app.put("/api/settings")
 async def update_settings(
     request: Request,
@@ -1716,11 +1620,6 @@ async def update_settings(
     return {"status": "saved", "settings": get_settings_for_site(db, current_user.site_id)}
 
 
-# ============================================================
-# DANGER ZONE
-# ============================================================
-
-# ── A: auth + admin added ──
 @app.post("/api/danger/flush-alerts")
 def flush_alerts(current_user: User = Depends(get_current_user)):
     if current_user.role != "admin":
@@ -1737,17 +1636,12 @@ def flush_alerts(current_user: User = Depends(get_current_user)):
     return {"status": "flushed", "count": flushed}
 
 
-# ── A: auth + admin added ──
 @app.post("/api/danger/reset-tracks")
 def reset_tracks(current_user: User = Depends(get_current_user)):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Only admins can reset tracks")
     return {"status": "tracks_reset", "note": "Restart run_pipeline.py to fully reset ByteTrack state"}
 
-
-# ============================================================
-# ANALYTICS
-# ============================================================
 
 def get_date_range(from_date: str = None, to_date: str = None):
     if not from_date:
@@ -1868,10 +1762,6 @@ def false_positive_rate(
     return result
 
 
-# ============================================================
-# EXPORT (CSV + PDF)
-# ============================================================
-
 @app.get("/api/export/incidents")
 def export_incidents(
     format: str = "csv",
@@ -1925,7 +1815,7 @@ def export_incidents(
         story = []
         story.append(Paragraph("OMNIX Safety Report", title_style))
         site_display = site_settings["platform"].get("site_name", "Site A")
-        story.append(Paragraph(f"{site_display} · {from_str} to {to_str}", subtitle_style))
+        story.append(Paragraph(f"{site_display} — {from_str} to {to_str}", subtitle_style))
         story.append(Paragraph(f"Generated for {current_user.name or current_user.email} on {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", subtitle_style))
         story.append(Spacer(1, 0.5*cm))
         story.append(Paragraph("Summary", section_style))
