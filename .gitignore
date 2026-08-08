@@ -44,3 +44,6 @@ test_frame_*.jpg
 datasets/
 runs/self_learning/
 body.json
+
+# Local-only leftover, never tracked
+runs/detect/spill_model/
