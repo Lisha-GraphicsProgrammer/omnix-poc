@@ -17,12 +17,15 @@ DATASETS_DIR = Path("datasets")
 RUNS_DIR = Path("runs") / "self_learning"
 
 
-def train_model(class_name: str, epochs: int = 10, imgsz: int = 640, resume_from: str | None = None) -> dict:
+def train_model(class_name: str, epochs: int = 10, imgsz: int = 640, resume_from: str | None = None, on_epoch_end=None) -> dict:
     """
     Trains a YOLOv8n model on datasets/<class_name>/data.yaml.
     If resume_from is given (a path to a previous last.pt), continues from
     that checkpoint instead of starting fresh — this is what makes a job
     resumable across restarts rather than losing all progress.
+    on_epoch_end, if given, is registered as an Ultralytics training callback
+    (on_train_epoch_end) so the caller can report live per-epoch progress
+    without train_model() itself needing to know about jobs/DB rows.
     Returns a dict describing the outcome.
     """
     data_yaml = DATASETS_DIR / class_name / "data.yaml"
@@ -33,9 +36,13 @@ def train_model(class_name: str, epochs: int = 10, imgsz: int = 640, resume_from
     try:
         if resume_from and Path(resume_from).exists():
             model = YOLO(resume_from)
+            if on_epoch_end:
+                model.add_callback("on_train_epoch_end", on_epoch_end)
             results = model.train(resume=True)
         else:
             model = YOLO("yolov8n.pt")  # smallest base model — fastest on CPU
+            if on_epoch_end:
+                model.add_callback("on_train_epoch_end", on_epoch_end)
             results = model.train(
                 data=str(data_yaml),
                 epochs=epochs,
@@ -47,7 +54,13 @@ def train_model(class_name: str, epochs: int = 10, imgsz: int = 640, resume_from
                 verbose=True,
             )
 
-        weights_dir = RUNS_DIR / run_name / "weights"
+        # ── use Ultralytics' own reported save_dir rather than
+        # reconstructing the path ourselves — a global Ultralytics settings
+        # file can prepend an extra directory (e.g. "runs/detect") to
+        # whatever project path we pass in, so a hand-built path can silently
+        # miss the real weights file even on a fully successful run. ──
+        actual_save_dir = Path(results.save_dir) if hasattr(results, "save_dir") else (RUNS_DIR / run_name)
+        weights_dir = actual_save_dir / "weights"
         best_path = weights_dir / "best.pt"
         last_path = weights_dir / "last.pt"
 
@@ -59,7 +72,7 @@ def train_model(class_name: str, epochs: int = 10, imgsz: int = 640, resume_from
             "best_weights": str(best_path),
             "last_weights": str(last_path) if last_path.exists() else None,
             "epochs_run": epochs,
-            "run_dir": str(RUNS_DIR / run_name),
+            "run_dir": str(actual_save_dir),
         }
     except Exception as e:
         return {"success": False, "error": f"Training failed: {e}"}
@@ -71,18 +84,41 @@ def run_for_job(job_id: int, db_session, TrainingJob, epochs: int = 10):
     if not job:
         return
 
-    def _push_stage(name, status, detail=None):
+    def _push_stage(name, status, detail=None, progress_current=None, progress_total=None):
         stages = list(job.stages or [])
-        stages.append({
+        entry = {
             "name": name, "status": status, "detail": detail,
             "finished_at": datetime.now(timezone.utc).isoformat(),
-        })
+        }
+        if progress_current is not None:
+            entry["progress_current"] = progress_current
+        if progress_total is not None:
+            entry["progress_total"] = progress_total
+        stages.append(entry)
         job.stages = stages
         job.current_stage = name if status == "running" else job.current_stage
         db_session.commit()
 
-    _push_stage("training", "running", f"Training YOLOv8n for {epochs} epochs on {job.class_name}...")
-    result = train_model(job.class_name, epochs=epochs, resume_from=job.checkpoint_path)
+    def _on_epoch_end(trainer):
+        # ── reads the trainer's own epoch/epochs rather than the closed-over
+        # `epochs` arg, since a resumed run's true total is owned by
+        # Ultralytics' own state, not whatever we passed in this call. A
+        # progress-reporting hiccup here must never take down training
+        # itself, so any failure is swallowed. ──
+        try:
+            current = int(trainer.epoch) + 1  # trainer.epoch is 0-indexed
+            total = int(trainer.epochs)
+            _push_stage(
+                "training", "running",
+                f"Training epoch {current} of {total}...",
+                progress_current=current, progress_total=total,
+            )
+        except Exception:
+            pass
+
+    _push_stage("training", "running", f"Training YOLOv8n for {epochs} epochs on {job.class_name}...",
+                progress_current=0, progress_total=epochs)
+    result = train_model(job.class_name, epochs=epochs, resume_from=job.checkpoint_path, on_epoch_end=_on_epoch_end)
 
     if result["success"]:
         job.checkpoint_path = result["last_weights"]

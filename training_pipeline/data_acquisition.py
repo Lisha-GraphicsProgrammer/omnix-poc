@@ -27,7 +27,13 @@ def search_universe(class_name: str, min_images: int = 50) -> list[dict]:
     if not api_key:
         return []
 
-    query = f'class:{class_name} model:yolov8 images>{min_images}'
+    # ── class_name is stored/used elsewhere as snake_case (e.g.
+    # "welding_mask"), but Roboflow's search expects natural, space-separated
+    # text — searching the literal underscored string returns 0 results even
+    # when the equivalent phrase with spaces returns real candidates. Only
+    # the outgoing query is affected; the stored class_name is untouched. ──
+    search_phrase = class_name.replace("_", " ").replace("-", " ")
+    query = f'class:{search_phrase} model:yolov8 images>{min_images}'
     try:
         resp = requests.get(
             UNIVERSE_SEARCH_URL,
@@ -112,22 +118,91 @@ def acquire_dataset(class_name: str) -> dict:
 def run_for_job(job_id: int, db_session, TrainingJob):
     """Runs acquisition for a training job and updates its DB row with progress."""
     from datetime import datetime, timezone
+    import threading
+    import time
+
     job = db_session.query(TrainingJob).filter(TrainingJob.id == job_id).first()
     if not job:
         return
 
-    def _push_stage(name, status, detail=None):
+    def _push_stage(name, status, detail=None, progress_current=None, progress_total=None):
         stages = list(job.stages or [])
-        stages.append({
+        entry = {
             "name": name, "status": status, "detail": detail,
             "finished_at": datetime.now(timezone.utc).isoformat(),
-        })
+        }
+        if progress_current is not None:
+            entry["progress_current"] = progress_current
+        if progress_total is not None:
+            entry["progress_total"] = progress_total
+        stages.append(entry)
         job.stages = stages
         job.current_stage = name if status == "running" else job.current_stage
         db_session.commit()
 
     _push_stage("searching_data", "running", f"Searching Roboflow Universe for '{job.class_name}'...")
-    result = acquire_dataset(job.class_name)
+
+    candidates = search_universe(job.class_name)
+    if not candidates:
+        job.status = "failed"
+        job.error = (
+            f"No public Roboflow dataset found for class '{job.class_name}' "
+            f"(searched live via Universe Search API, 0 results with images>50)."
+        )
+        _push_stage("searching_data", "failed", job.error)
+        return
+
+    top = candidates[0]
+    target_total = top.get("images", 0) or None
+    img_dir = DATASETS_DIR / job.class_name / "train" / "images"
+    source_label = f"{top['workspace']}/{top['project']}"
+
+    # ── the actual download call below blocks for its full duration with no
+    # progress hook exposed by the Roboflow SDK, so a separate thread polls
+    # the destination folder's growing file count instead. It uses its own
+    # DB session (not job's/db_session, which belongs to the main thread) so
+    # the two never touch the same SQLAlchemy Session concurrently. ──
+    stop_flag = threading.Event()
+
+    def _poll_download_progress():
+        from db.session import SessionLocal
+        poll_db = SessionLocal()
+        try:
+            while not stop_flag.wait(1.5):
+                try:
+                    count = sum(1 for _ in img_dir.glob("*")) if img_dir.exists() else 0
+                    if count > 0:
+                        j = poll_db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+                        if not j:
+                            continue
+                        total_label = f" of {target_total}" if target_total else ""
+                        stages = list(j.stages or [])
+                        stages.append({
+                            "name": "searching_data", "status": "running",
+                            "detail": f"Downloading {count}{total_label} images from {source_label}...",
+                            "progress_current": count,
+                            "progress_total": target_total,
+                            "finished_at": datetime.now(timezone.utc).isoformat(),
+                        })
+                        j.stages = stages
+                        poll_db.commit()
+                except Exception:
+                    poll_db.rollback()
+        finally:
+            poll_db.close()
+
+    poller = threading.Thread(target=_poll_download_progress, daemon=True)
+    poller.start()
+    try:
+        result = acquire_dataset(job.class_name)
+    finally:
+        stop_flag.set()
+        poller.join(timeout=3)
+
+    # ── the poller may have committed its own last snapshot of `job.stages`
+    # from its separate session — refresh so this thread's next commit
+    # doesn't silently overwrite that history with a stale in-memory copy ──
+    db_session.refresh(job)
 
     if result["success"]:
         job.dataset_info = result
