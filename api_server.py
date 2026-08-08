@@ -255,6 +255,58 @@ def _reconnect_monitor():
             db.close()
 
 
+def _self_learning_worker_loop():
+    """
+    Self-learning: background worker that advances unknown-class training jobs
+    automatically. Started from on_startup so it runs the moment the backend
+    is up, no manual worker.py step required from anyone.
+    """
+    from db.models import TrainingJob
+    from training_pipeline.data_acquisition import run_for_job as acquire_step
+    from training_pipeline.dataset_prep import run_for_job as prep_step
+    from training_pipeline.train import run_for_job as train_step
+    from training_pipeline.evaluate import run_for_job as eval_step
+
+    STAGE_HANDLERS = {
+        "queued": acquire_step,
+        "searching_data": acquire_step,
+        "preparing_dataset": prep_step,
+        "training": lambda jid, dbs, Model: train_step(jid, dbs, Model, epochs=10),
+        "evaluating": eval_step,
+    }
+    DONE_STAGES = ("awaiting_approval", "approved")
+    TERMINAL_STATUSES = ("failed", "cancelled", "approved")
+
+    while True:
+        db2 = SessionLocal()
+        try:
+            jobs = db2.query(TrainingJob).filter(
+                TrainingJob.status.notin_(TERMINAL_STATUSES),
+            ).all()
+            for job in jobs:
+                stage = job.current_stage or "queued"
+                if stage in DONE_STAGES:
+                    continue
+                handler = STAGE_HANDLERS.get(stage)
+                if not handler:
+                    continue
+                print(f"[SELF-LEARNING] Job {job.id} ({job.class_name}): advancing stage '{stage}'...")
+                try:
+                    handler(job.id, db2, TrainingJob)
+                    db2.refresh(job)
+                    print(f"[SELF-LEARNING] Job {job.id} ({job.class_name}): now at '{job.current_stage}', status '{job.status}'")
+                except Exception as e:
+                    print(f"[SELF-LEARNING] Job {job.id} ({job.class_name}): stage '{stage}' crashed: {e}")
+                    job.status = "failed"
+                    job.error = f"Worker crash during {stage}: {e}"
+                    db2.commit()
+        except Exception as e:
+            print(f"[SELF-LEARNING] Worker poll cycle error: {e}")
+        finally:
+            db2.close()
+        time.sleep(10)
+
+
 @app.on_event("startup")
 def on_startup():
     seed()
@@ -285,6 +337,9 @@ def on_startup():
         db.close()
     threading.Thread(target=_reconnect_monitor, daemon=True).start()
     print(f"[OMNIX] Reconnect monitor started (checks every {RECONNECT_INTERVAL_SECONDS}s)")
+
+    threading.Thread(target=_self_learning_worker_loop, daemon=True).start()
+    print("[OMNIX] Self-learning background worker started (checks every 10s)")
 
 
 # ============================================================
@@ -1110,6 +1165,9 @@ async def generate_rule(
         for r in config.get("rules", []):
             if r.get("target"):
                 _requested.add(r["target"])
+            if r.get("type") == "missing_in_zone":
+                for item in r.get("required", []) or []:
+                    _requested.add(item)
         unknown_classes = sorted(c for c in _requested if c not in _registry)
         training_jobs = []
         if unknown_classes:
