@@ -42,5 +42,17 @@
     "weights": "runs/self_learning/trousers_model/weights/best.pt",
     "confidence": 0.6284,
     "conf_threshold": 0.5
+  },
+  "glove": {
+    "type": "custom",
+    "weights": "runs\\self_learning\\glove_model\\weights\\best.pt",
+    "confidence": 0.5901,
+    "conf_threshold": 0.5
+  },
+  "goggles": {
+    "type": "custom",
+    "weights": "runs\\self_learning\\goggles_model\\weights\\best.pt",
+    "confidence": 0.7452,
+    "conf_threshold": 0.5
   }
 }
