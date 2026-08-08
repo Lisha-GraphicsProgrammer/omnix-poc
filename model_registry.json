@@ -54,5 +54,11 @@
     "weights": "runs\\self_learning\\goggles_model\\weights\\best.pt",
     "confidence": 0.7452,
     "conf_threshold": 0.5
+  },
+  "safety_boots": {
+    "type": "custom",
+    "weights": "C:\\dev\\omnix-poc\\runs\\self_learning\\safety_boots_model\\weights\\best.pt",
+    "confidence": 0.8657,
+    "conf_threshold": 0.5
   }
 }
