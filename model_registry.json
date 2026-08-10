@@ -1,8 +1,64 @@
 {
-  "person":   { "type": "coco_default", "class_id": 0, "model": "yolov8n.pt", "confidence": 0.5, "conf_threshold": 0.4 },
-  "truck":    { "type": "coco_default", "class_id": 7, "model": "yolov8n.pt", "confidence": 0.7, "conf_threshold": 0.5 },
-  "helmet":   { "type": "custom", "weights": "runs/detect/helmet_model/weights/best.pt", "confidence": 0.65, "conf_threshold": 0.5 },
-  "fire":     { "type": "custom", "weights": "runs/detect/fire_model/weights/best.pt", "confidence": 0.7, "conf_threshold": 0.6 },
-  "smoke":    { "type": "custom", "weights": "runs/detect/smoke_model/weights/best.pt", "confidence": 0.7, "conf_threshold": 0.6 },
-  "spill":    { "type": "custom", "weights": "runs/detect/spill_model/weights/best.pt", "confidence": 0.5, "conf_threshold": 0.6 }
+  "person": {
+    "type": "coco_default",
+    "class_id": 0,
+    "model": "yolov8n.pt",
+    "confidence": 0.5,
+    "conf_threshold": 0.4
+  },
+  "truck": {
+    "type": "coco_default",
+    "class_id": 7,
+    "model": "yolov8n.pt",
+    "confidence": 0.7,
+    "conf_threshold": 0.5
+  },
+  "helmet": {
+    "type": "custom",
+    "weights": "runs/detect/helmet_model/weights/best.pt",
+    "confidence": 0.65,
+    "conf_threshold": 0.5
+  },
+  "fire": {
+    "type": "custom",
+    "weights": "runs/detect/fire_model/weights/best.pt",
+    "confidence": 0.7,
+    "conf_threshold": 0.6
+  },
+  "smoke": {
+    "type": "custom",
+    "weights": "runs/detect/smoke_model/weights/best.pt",
+    "confidence": 0.7,
+    "conf_threshold": 0.6
+  },
+  "spill": {
+    "type": "custom",
+    "weights": "runs/detect/spill_model/weights/best.pt",
+    "confidence": 0.5,
+    "conf_threshold": 0.6
+  },
+  "trousers": {
+    "type": "custom",
+    "weights": "runs/self_learning/trousers_model/weights/best.pt",
+    "confidence": 0.6284,
+    "conf_threshold": 0.5
+  },
+  "glove": {
+    "type": "custom",
+    "weights": "runs\\self_learning\\glove_model\\weights\\best.pt",
+    "confidence": 0.5901,
+    "conf_threshold": 0.5
+  },
+  "goggles": {
+    "type": "custom",
+    "weights": "runs\\self_learning\\goggles_model\\weights\\best.pt",
+    "confidence": 0.7452,
+    "conf_threshold": 0.5
+  },
+  "safety_boots": {
+    "type": "custom",
+    "weights": "C:\\dev\\omnix-poc\\runs\\self_learning\\safety_boots_model\\weights\\best.pt",
+    "confidence": 0.8657,
+    "conf_threshold": 0.5
+  }
 }

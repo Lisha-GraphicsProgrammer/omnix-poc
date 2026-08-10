@@ -99,3 +99,21 @@ class Setting(Base):
     key        = Column(Text, nullable=False)
     value      = Column(JSONB)
     updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+
+
+class TrainingJob(Base):
+    __tablename__ = "training_jobs"
+    id              = Column(Integer, primary_key=True)
+    site_id         = Column(Integer, nullable=False)
+    class_name      = Column(Text, nullable=False)
+    rule_id         = Column(Integer, ForeignKey("rules.id", ondelete="SET NULL"), nullable=True)
+    status          = Column(Text, default="pending", nullable=False)
+    current_stage   = Column(Text)
+    stages          = Column(JSONB, default=list, nullable=False)
+    dataset_info    = Column(JSONB)
+    checkpoint_path = Column(Text)
+    model_path      = Column(Text)
+    metrics         = Column(JSONB)
+    error           = Column(Text)
+    created_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    updated_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
