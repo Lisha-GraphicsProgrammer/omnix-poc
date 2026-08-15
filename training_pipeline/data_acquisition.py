@@ -65,7 +65,43 @@ def search_universe(class_name: str, min_images: int = 50) -> list[dict]:
             "stars": r.get("stars", 0),
             "license": r.get("license", "unknown"),
             "url": dataset_url,
+            "classes": r.get("classes", []) or [],
         })
+
+    # ── Relevance filter: reject datasets whose class list has nothing to
+    # do with what was actually searched. Ranking by image count alone
+    # previously let a completely unrelated dataset (e.g. a 41-class "pet
+    # monitoring" set) win just because its size happened to be close to
+    # our target — real classes are checked here instead, so a class name
+    # or a close variant must actually appear before a candidate is ranked. ──
+    def _normalize(s: str) -> str:
+        return s.lower().replace("_", " ").replace("-", " ").strip()
+
+    def is_relevant(c: dict, term: str) -> bool:
+        norm_term = _normalize(term)
+        term_words = norm_term.split()
+        # Common short words carry no distinguishing signal on their own
+        # (e.g. "ear" alone matches "Jelly Ear Mushroom") — require the full
+        # multi-word phrase to appear, or the single word itself only when
+        # the search term IS a single word.
+        for cls in c.get("classes", []):
+            norm_cls = _normalize(str(cls))
+            if len(term_words) > 1:
+                if norm_term in norm_cls:
+                    return True
+            else:
+                cls_words = set(norm_cls.split())
+                if norm_term in cls_words:
+                    return True
+        return False
+
+    relevant = [c for c in candidates if is_relevant(c, class_name)]
+    if not relevant:
+        # Genuinely nothing with a matching class was found — return
+        # nothing rather than silently falling back to an irrelevant
+        # dataset, so the caller reports "no dataset found" honestly
+        # instead of training on garbage data.
+        return []
 
     # Prefer datasets in a practical size range for fast iteration (a few
     # hundred to a few thousand images) over raw maximum size. A 900-image
@@ -78,8 +114,8 @@ def search_universe(class_name: str, min_images: int = 50) -> list[dict]:
         size_score = -abs(images - 3000)
         return (size_score, c["stars"])
 
-    candidates.sort(key=rank_score, reverse=True)
-    return candidates
+    relevant.sort(key=rank_score, reverse=True)
+    return relevant
 
 
 def acquire_dataset(class_name: str) -> dict:
