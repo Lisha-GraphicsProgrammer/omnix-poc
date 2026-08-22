@@ -40,7 +40,7 @@ def train_model(class_name: str, epochs: int = 10, imgsz: int = 640, resume_from
                 model.add_callback("on_train_epoch_end", on_epoch_end)
             results = model.train(resume=True)
         else:
-            model = YOLO("yolov8n.pt")  # smallest base model — fastest on CPU
+            model = YOLO("yolo26n.pt") # smallest base model — fastest on CPU
             if on_epoch_end:
                 model.add_callback("on_train_epoch_end", on_epoch_end)
             results = model.train(

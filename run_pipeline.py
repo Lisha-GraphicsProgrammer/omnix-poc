@@ -122,7 +122,7 @@ def load_model_from_registry(model_name: str) -> YOLO | None:
     model_type = entry.get("type", "custom")
 
     if model_type == "coco_default":
-        model_path = entry.get("model", "yolov8n.pt")
+        model_path = entry.get("model", "yolo26n.pt")
         if not Path(model_path).exists():
             print(f"  [SKIP] {model_name}: base model {model_path} not found")
             return None
@@ -170,7 +170,7 @@ for model_name in needed_models:
         models[model_name] = m
 
 base_entry   = registry.get("person", {})
-base_model_path = base_entry.get("model", "yolov8n.pt")
+base_model_path = base_entry.get("model", "yolo26n.pt")
 # ── Part 2 / Task 3: use conf_threshold for person model, falling back to the
 # Settings-driven GLOBAL_DETECTION_CONFIDENCE instead of a hardcoded 0.5 ──
 base_conf    = get_model_conf("person", fallback=GLOBAL_DETECTION_CONFIDENCE)
