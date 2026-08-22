@@ -33,7 +33,7 @@ load_dotenv()
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
 
-app = FastAPI(title="OMNIX POC API")
+app = FastAPI(title="ONVXP Service API")
 
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173")
 ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
@@ -558,7 +558,7 @@ def delete_zone(
 
 @app.get("/")
 def root():
-    return {"status": "OMNIX POC API running", "llm_provider": "ollama", "model": OLLAMA_MODEL}
+    return {"status": "ONVXP Service API running", "llm_provider": "ollama", "model": OLLAMA_MODEL}
 
 
 @app.get("/api/incidents")
@@ -1009,11 +1009,11 @@ def delete_rule(
     return {"status": "deleted", "rule_id": rule_id}
 
 
-SYSTEM_PROMPT = """You are OMNIX's rule generator. Convert plain English safety instructions into valid pipeline_config.json for a YOLOv8 + ByteTrack computer vision pipeline.
+SYSTEM_PROMPT = """You are ONVXP's rule generator. Convert plain English safety instructions into valid pipeline_config.json for a YOLO26 + ByteTrack computer vision pipeline.
 
 AVAILABLE MODELS:
-- "person"   - detects people on site (base YOLOv8, COCO trained)
-- "truck"    - detects trucks and heavy vehicles (base YOLOv8, COCO trained)
+- "person"   - detects people on site (base YOLO26, COCO trained)
+- "truck"    - detects trucks and heavy vehicles (base YOLO26, COCO trained)
 - "helmet"   - detects construction hardhats (custom trained)
 - "fire"     - detects fire and flames (custom trained, mAP 75%)
 - "smoke"    - detects smoke on site (custom trained, mAP 75%)
