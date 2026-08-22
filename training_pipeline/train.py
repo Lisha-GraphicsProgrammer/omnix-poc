@@ -1,9 +1,9 @@
 """
 Self-Learning Pipeline — Step 6: Training Agent
 
-Fine-tunes a YOLOv8 model on a prepared dataset, saving epoch checkpoints
+Fine-tunes a YOLO26 model on a prepared dataset, saving epoch checkpoints
 so a resumed training job can pick up where it left off (the resumability
-requirement from the original design). v1 trains ONE candidate (yolov8n,
+requirement from the original design). v1 trains ONE candidate (yolo26n,
 the smallest/fastest model) rather than multiple candidates in parallel —
 multi-candidate HPO is a documented v2 upgrade.
 """
@@ -19,7 +19,7 @@ RUNS_DIR = Path("runs") / "self_learning"
 
 def train_model(class_name: str, epochs: int = 10, imgsz: int = 640, resume_from: str | None = None, on_epoch_end=None) -> dict:
     """
-    Trains a YOLOv8n model on datasets/<class_name>/data.yaml.
+    Trains a YOLO26n model on datasets/<class_name>/data.yaml.
     If resume_from is given (a path to a previous last.pt), continues from
     that checkpoint instead of starting fresh — this is what makes a job
     resumable across restarts rather than losing all progress.
@@ -40,7 +40,7 @@ def train_model(class_name: str, epochs: int = 10, imgsz: int = 640, resume_from
                 model.add_callback("on_train_epoch_end", on_epoch_end)
             results = model.train(resume=True)
         else:
-            model = YOLO("yolov8n.pt")  # smallest base model — fastest on CPU
+            model = YOLO("yolo26n.pt") # smallest base model — fastest on CPU
             if on_epoch_end:
                 model.add_callback("on_train_epoch_end", on_epoch_end)
             results = model.train(
@@ -116,8 +116,8 @@ def run_for_job(job_id: int, db_session, TrainingJob, epochs: int = 10):
         except Exception:
             pass
 
-    _push_stage("training", "running", f"Training YOLOv8n for {epochs} epochs on {job.class_name}...",
-                progress_current=0, progress_total=epochs)
+    _push_stage("training", "running", f"Training YOLO26n for {epochs} epochs on {job.class_name}...",
+        progress_current=0, progress_total=epochs)
     result = train_model(job.class_name, epochs=epochs, resume_from=job.checkpoint_path, on_epoch_end=_on_epoch_end)
 
     if result["success"]:

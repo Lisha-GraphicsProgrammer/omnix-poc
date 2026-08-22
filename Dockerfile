@@ -1,4 +1,4 @@
-# OMNIX POC API — FastAPI backend + YOLOv8/ByteTrack pipeline
+# ONVXP Service — FastAPI backend + YOLO26/ByteTrack pipeline
 #
 # NOTE: This container runs the API and the detection pipeline (run_pipeline.py,
 # launched as a subprocess by the API — see DEPLOY.md for details on that model).
