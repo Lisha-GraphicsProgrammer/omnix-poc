@@ -1523,6 +1523,13 @@ async def set_video_source(
             video_streams[camera_id] = vs
     if not success:
         raise HTTPException(status_code=500, detail="Failed to open video source")
+    # ── persist to DB so the change survives a backend restart, not just the
+    # in-memory stream — previously this only updated video_streams, so the
+    # source silently reverted to the DB's stale value on every restart. ──
+    cam = db.query(CameraModel).filter(CameraModel.id == camera_id).first()
+    if cam:
+        cam.source = str(source)
+        db.commit()
     return {"status": "ok", "source": str(source), "fps": vs.fps, "camera_id": camera_id}
 
 
