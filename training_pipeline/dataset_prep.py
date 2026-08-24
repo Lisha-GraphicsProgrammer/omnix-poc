@@ -4,6 +4,9 @@ Self-Learning Pipeline — Step 5: Dataset Preparation
 Verifies a downloaded dataset is clean and training-ready:
 - every image actually opens (catches corrupted downloads)
 - every label file is valid YOLO format (class_id x y w h, values in [0,1])
+- converts segmentation-polygon labels (some Roboflow exports return these
+  even when yolov8 bbox format is requested) into their enclosing bounding
+  box, rather than rejecting them as malformed
 - reports class balance (how many labeled instances exist)
 - confirms train/valid/test split is present and non-empty
 
@@ -41,10 +44,39 @@ def _check_split(split_dir: Path) -> dict:
         label_path = labels_dir / (img_path.stem + ".txt")
         if not label_path.exists():
             continue
+
+        converted_lines = []
+        needs_rewrite = False
         for line_num, line in enumerate(label_path.read_text().splitlines(), 1):
             if not line.strip():
                 continue
             parts = line.split()
+
+            # Segmentation polygon (class_id + many x,y pairs) — convert to
+            # its enclosing bounding box instead of rejecting it.
+            if len(parts) > 5 and (len(parts) - 1) % 2 == 0:
+                try:
+                    cls_id = int(parts[0])
+                    coords = list(map(float, parts[1:]))
+                    xs = coords[0::2]
+                    ys = coords[1::2]
+                    x_min, x_max = min(xs), max(xs)
+                    y_min, y_max = min(ys), max(ys)
+                    if not all(0 <= v <= 1 for v in (x_min, x_max, y_min, y_max)):
+                        malformed_labels.append(f"{label_path.name}:{line_num} (out of range)")
+                        continue
+                    x = (x_min + x_max) / 2
+                    y = (y_min + y_max) / 2
+                    w = x_max - x_min
+                    h = y_max - y_min
+                    converted_lines.append(f"{cls_id} {x} {y} {w} {h}")
+                    needs_rewrite = True
+                    label_instance_count += 1
+                    continue
+                except ValueError:
+                    malformed_labels.append(f"{label_path.name}:{line_num} (parse error)")
+                    continue
+
             if len(parts) != 5:
                 malformed_labels.append(f"{label_path.name}:{line_num}")
                 continue
@@ -56,7 +88,11 @@ def _check_split(split_dir: Path) -> dict:
             except ValueError:
                 malformed_labels.append(f"{label_path.name}:{line_num} (parse error)")
                 continue
+            converted_lines.append(line)
             label_instance_count += 1
+
+        if needs_rewrite:
+            label_path.write_text("\n".join(converted_lines) + "\n")
 
     return {
         "exists": True,
