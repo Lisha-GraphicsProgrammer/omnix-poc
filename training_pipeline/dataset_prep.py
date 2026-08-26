@@ -7,15 +7,20 @@ Verifies a downloaded dataset is clean and training-ready:
 - converts segmentation-polygon labels (some Roboflow exports return these
   even when yolov8 bbox format is requested) into their enclosing bounding
   box, rather than rejecting them as malformed
+- if a dataset ships only a train split (no valid/test), carves off a
+  portion of train into a real valid split, since Ultralytics' training
+  code requires data.yaml's val: path to actually exist on disk
 - reports class balance (how many labeled instances exist)
 - confirms train/valid/test split is present and non-empty
 
-Does NOT re-split data — Roboflow's own train/valid/test split is trusted
-as-is for v1. This step is a quality gate before spending time training on
-possibly-broken data, not a dataset engineering pipeline (v2: dedup across
-splits, custom split ratios, synthetic augmentation).
+Does NOT re-split data beyond the train-only fallback above — Roboflow's
+own train/valid/test split is otherwise trusted as-is for v1. This step is
+a quality gate before spending time training on possibly-broken data, not
+a full dataset engineering pipeline (v2: dedup across splits, custom split
+ratios, synthetic augmentation).
 """
 import json
+import shutil
 from pathlib import Path
 from PIL import Image
 
@@ -125,6 +130,40 @@ def prepare_dataset(class_name: str) -> dict:
             total_corrupted += len(result["corrupted_images"])
             total_malformed += len(result["malformed_labels"])
             total_instances += result["label_instances"]
+
+    # ── Some Roboflow exports ship only a train split, no valid/test —
+    # Ultralytics' training code requires data.yaml's val: path to actually
+    # exist on disk, so carve off a small portion of train into a real
+    # valid folder rather than failing at the training stage. ──
+    if not report["splits"].get("valid", {}).get("exists") and report["splits"].get("train", {}).get("exists"):
+        train_img_dir = dataset_dir / "train" / "images"
+        train_lbl_dir = dataset_dir / "train" / "labels"
+        valid_img_dir = dataset_dir / "valid" / "images"
+        valid_lbl_dir = dataset_dir / "valid" / "labels"
+        all_images = sorted(train_img_dir.glob("*"))
+        split_count = max(1, len(all_images) // 5)  # ~20% to validation
+        valid_img_dir.mkdir(parents=True, exist_ok=True)
+        valid_lbl_dir.mkdir(parents=True, exist_ok=True)
+        for img_path in all_images[:split_count]:
+            shutil.move(str(img_path), str(valid_img_dir / img_path.name))
+            lbl_path = train_lbl_dir / (img_path.stem + ".txt")
+            if lbl_path.exists():
+                shutil.move(str(lbl_path), str(valid_lbl_dir / lbl_path.name))
+        # re-check both splits now that files have actually moved
+        report["splits"]["train"] = _check_split(dataset_dir / "train")
+        report["splits"]["valid"] = _check_split(dataset_dir / "valid")
+        total_instances = (
+            report["splits"]["train"]["label_instances"]
+            + report["splits"]["valid"]["label_instances"]
+        )
+        total_corrupted = (
+            len(report["splits"]["train"]["corrupted_images"])
+            + len(report["splits"]["valid"]["corrupted_images"])
+        )
+        total_malformed = (
+            len(report["splits"]["train"]["malformed_labels"])
+            + len(report["splits"]["valid"]["malformed_labels"])
+        )
 
     report["total_label_instances"] = total_instances
     report["total_corrupted_images"] = total_corrupted
