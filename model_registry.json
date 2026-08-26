@@ -57,8 +57,26 @@
   },
   "safety_boots": {
     "type": "custom",
-    "weights": "C:\\dev\\omnix-poc\\runs\\self_learning\\safety_boots_model\\weights\\best.pt",
+    "weights": "runs/self_learning/safety_boots_model/weights/best.pt",
     "confidence": 0.8657,
+    "conf_threshold": 0.5
+  },
+  "gloves": {
+    "type": "custom",
+    "weights": "C:\\dev\\onvxp-service\\runs\\detect\\runs\\self_learning\\gloves_model\\weights\\best.pt",
+    "confidence": 0.5827,
+    "conf_threshold": 0.5
+  },
+  "forklift": {
+    "type": "custom",
+    "weights": "C:\\dev\\onvxp-service\\runs\\detect\\runs\\self_learning\\forklift_model\\weights\\best.pt",
+    "confidence": 0.8862,
+    "conf_threshold": 0.5
+  },
+  "ear_protection": {
+    "type": "custom",
+    "weights": "C:\\dev\\onvxp-service\\runs\\detect\\runs\\self_learning\\ear_protection_model\\weights\\best.pt",
+    "confidence": 0.79,
     "conf_threshold": 0.5
   }
 }
