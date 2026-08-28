@@ -792,27 +792,73 @@ def get_incidents_map(
 
 @app.get("/api/training-jobs")
 def list_training_jobs(
+    page: int = 1,
+    page_size: int = 20,
+    status: str = None,
+    search: str = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     from db.models import TrainingJob
-    jobs = db.query(TrainingJob).filter(
-        TrainingJob.site_id == current_user.site_id
-    ).order_by(TrainingJob.created_at.desc()).all()
-    return [
-        {
-            "id": j.id,
-            "class_name": j.class_name,
-            "status": j.status,
-            "current_stage": j.current_stage,
-            "stages": j.stages,
-            "metrics": j.metrics,
-            "error": j.error,
-            "created_at": j.created_at.isoformat() if j.created_at else None,
-            "updated_at": j.updated_at.isoformat() if j.updated_at else None,
-        }
-        for j in jobs
-    ]
+
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
+
+    q = db.query(TrainingJob).filter(
+        TrainingJob.site_id == current_user.site_id,
+        TrainingJob.status != "cancelled",
+    )
+
+    if search:
+        q = q.filter(TrainingJob.class_name.ilike(f"%{search.strip()}%"))
+
+    if status == "in_progress":
+        q = q.filter(
+            TrainingJob.status.notin_(["approved", "failed"]),
+            TrainingJob.current_stage != "awaiting_approval",
+        )
+    elif status == "awaiting_approval":
+        q = q.filter(
+            TrainingJob.current_stage == "awaiting_approval",
+            TrainingJob.status.notin_(["approved", "failed"]),
+        )
+    elif status == "approved":
+        q = q.filter(TrainingJob.status == "approved")
+    elif status == "failed":
+        q = q.filter(TrainingJob.status == "failed")
+    # status is None or "all" -> no extra filter beyond excluding cancelled above
+
+    total = q.count()
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = min(page, total_pages)
+
+    jobs = (
+        q.order_by(TrainingJob.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    return {
+        "items": [
+            {
+                "id": j.id,
+                "class_name": j.class_name,
+                "status": j.status,
+                "current_stage": j.current_stage,
+                "stages": j.stages,
+                "metrics": j.metrics,
+                "error": j.error,
+                "created_at": j.created_at.isoformat() if j.created_at else None,
+                "updated_at": j.updated_at.isoformat() if j.updated_at else None,
+            }
+            for j in jobs
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+    }
 
 
 @app.get("/api/training-jobs/{job_id}")
@@ -1523,13 +1569,6 @@ async def set_video_source(
             video_streams[camera_id] = vs
     if not success:
         raise HTTPException(status_code=500, detail="Failed to open video source")
-    # ── persist to DB so the change survives a backend restart, not just the
-    # in-memory stream — previously this only updated video_streams, so the
-    # source silently reverted to the DB's stale value on every restart. ──
-    cam = db.query(CameraModel).filter(CameraModel.id == camera_id).first()
-    if cam:
-        cam.source = str(source)
-        db.commit()
     return {"status": "ok", "source": str(source), "fps": vs.fps, "camera_id": camera_id}
 
 
