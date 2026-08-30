@@ -27,10 +27,24 @@ class User(Base):
     last_login    = Column(TIMESTAMP(timezone=True))
 
 
+# ── Zone — a named building/place (e.g. "Tower Two", "Main Warehouse").
+# No polygon, no color, no single-camera tie: it's purely an organizational
+# label a camera belongs to, not a hand-drawn region within a frame. ──
+class Zone(Base):
+    __tablename__ = "zones"
+    id         = Column(Integer, primary_key=True)
+    site_id    = Column(Integer, ForeignKey("sites.id", ondelete="CASCADE"), nullable=False)
+    name       = Column(Text, nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+
+
+# ── Camera — now belongs to exactly one Zone (a building/place), inverting
+# the old relationship where Zone belonged to one Camera. ──
 class Camera(Base):
     __tablename__ = "cameras"
     id         = Column(Integer, primary_key=True)
     site_id    = Column(Integer, ForeignKey("sites.id", ondelete="CASCADE"), nullable=False)
+    zone_id    = Column(Integer, ForeignKey("zones.id", ondelete="SET NULL"), nullable=True)
     name       = Column(Text, nullable=False)
     location   = Column(Text)
     source     = Column(Text, nullable=False)
@@ -40,25 +54,11 @@ class Camera(Base):
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
 
-class Zone(Base):
-    __tablename__ = "zones"
-    id         = Column(Integer, primary_key=True)
-    site_id    = Column(Integer, ForeignKey("sites.id", ondelete="CASCADE"), nullable=False)
-    camera_id  = Column(Integer, ForeignKey("cameras.id", ondelete="SET NULL"), nullable=True)
-    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
-    name       = Column(Text, nullable=False)
-    polygon    = Column(JSONB, nullable=False)  # [[x,y], [x,y], ...]
-    color      = Column(Text, default="#00D4FF")
-    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
-    updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
-
-
 class Rule(Base):
     __tablename__ = "rules"
     id          = Column(Integer, primary_key=True)
     site_id     = Column(Integer, ForeignKey("sites.id", ondelete="CASCADE"), nullable=False)
     user_id     = Column(Integer, ForeignKey("users.id"), nullable=False)
-    zone_id     = Column(Integer, ForeignKey("zones.id", ondelete="SET NULL"), nullable=True)
     instruction = Column(Text, nullable=False)
     config_json = Column(JSONB, nullable=False)
     pipeline_id = Column(Text)
@@ -66,6 +66,19 @@ class Rule(Base):
     severity    = Column(Text)
     created_at  = Column(TIMESTAMP(timezone=True), server_default=func.now())
     updated_at  = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    # Which camera(s) this rule applies to now lives in RuleCamera below —
+    # a rule can span any combination of cameras across any zones, so a
+    # single zone_id/camera_id column can't represent that anymore.
+
+
+# ── Join table: one rule can apply to many cameras, and (implicitly, since
+# each camera belongs to one zone) any combination of zones too — e.g. a
+# single rule watching Camera 1 in Zone 1 and Camera 4 in Zone 5 at once. ──
+class RuleCamera(Base):
+    __tablename__ = "rule_cameras"
+    id        = Column(Integer, primary_key=True)
+    rule_id   = Column(Integer, ForeignKey("rules.id", ondelete="CASCADE"), nullable=False)
+    camera_id = Column(Integer, ForeignKey("cameras.id", ondelete="CASCADE"), nullable=False)
 
 
 class Incident(Base):

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse, Response
@@ -18,11 +18,10 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from collections import defaultdict
 import csv
-import difflib
 import io
 
 from db.session import get_db, SessionLocal
-from db.models import User, Rule, Incident, Camera as CameraModel, Site, Zone, Setting
+from db.models import User, Rule, Incident, Camera as CameraModel, Site, Zone, Setting, RuleCamera
 from auth.password import hash_password, verify_password
 from auth.jwt_handler import create_token
 from auth.dependencies import get_current_user
@@ -51,7 +50,6 @@ app.mount("/screenshots", StaticFiles(directory="incidents"), name="screenshots"
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 
-ZONE_COLORS = ["#00D4FF", "#00E676", "#FFB300", "#7C3AED", "#FF4444", "#FF6B6B", "#818cf8", "#f472b6"]
 
 RECONNECT_INTERVAL_SECONDS = 5
 CONSECUTIVE_FAILURE_THRESHOLD = 10
@@ -429,21 +427,14 @@ def get_users(
 
 @app.get("/api/zones")
 def get_zones(
-    camera_id: int = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    q = db.query(Zone).filter(Zone.site_id == current_user.site_id)
-    if camera_id is not None:
-        q = q.filter(Zone.camera_id == camera_id)
-    zones = q.all()
+    zones = db.query(Zone).filter(Zone.site_id == current_user.site_id).order_by(Zone.name).all()
     return [
         {
             "id": z.id,
             "name": z.name,
-            "polygon": z.polygon,
-            "color": z.color,
-            "camera_id": z.camera_id,
             "created_at": z.created_at.isoformat() if z.created_at else None,
         }
         for z in zones
@@ -460,46 +451,15 @@ async def create_zone(
         raise HTTPException(status_code=403, detail="Viewers cannot create zones")
     body = await request.json()
     name = body.get("name", "").strip()
-    polygon = body.get("polygon", [])
-    camera_id = body.get("camera_id", None)
     if not name:
         raise HTTPException(status_code=400, detail="name is required")
-    if len(polygon) < 3:
-        raise HTTPException(status_code=400, detail="polygon must have at least 3 points")
-    count = db.query(Zone).filter(Zone.site_id == current_user.site_id).count()
-    color = body.get("color", ZONE_COLORS[count % len(ZONE_COLORS)])
-
-    if camera_id is not None:
-        cam = db.query(CameraModel).filter(CameraModel.id == camera_id).first()
-        if cam is None:
-            cam = CameraModel(
-                id=camera_id,
-                site_id=current_user.site_id,
-                name=f"Camera {camera_id}",
-                location="",
-                source="default",
-                status="online" if camera_id == 1 else "offline",
-            )
-            db.add(cam)
-            db.flush()
-
-    zone = Zone(
-        site_id=current_user.site_id,
-        camera_id=camera_id,
-        created_by=current_user.id,
-        name=name,
-        polygon=polygon,
-        color=color,
-    )
+    zone = Zone(site_id=current_user.site_id, name=name)
     db.add(zone)
     db.commit()
     db.refresh(zone)
     return {
         "id": zone.id,
         "name": zone.name,
-        "polygon": zone.polygon,
-        "color": zone.color,
-        "camera_id": zone.camera_id,
         "created_at": zone.created_at.isoformat() if zone.created_at else None,
     }
 
@@ -521,20 +481,13 @@ async def update_zone(
         raise HTTPException(status_code=404, detail="Zone not found")
     body = await request.json()
     if "name" in body:
-        zone.name = body["name"].strip()
-    if "polygon" in body:
-        zone.polygon = body["polygon"]
-    if "color" in body:
-        zone.color = body["color"]
+        name = body["name"].strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="name cannot be empty")
+        zone.name = name
     db.commit()
     db.refresh(zone)
-    return {
-        "id": zone.id,
-        "name": zone.name,
-        "polygon": zone.polygon,
-        "color": zone.color,
-        "camera_id": zone.camera_id,
-    }
+    return {"id": zone.id, "name": zone.name}
 
 
 @app.delete("/api/zones/{zone_id}")
@@ -551,6 +504,9 @@ def delete_zone(
     ).first()
     if not zone:
         raise HTTPException(status_code=404, detail="Zone not found")
+    # Cameras in this zone become zone-less rather than being deleted too —
+    # deleting a building shouldn't delete the cameras inside it.
+    db.query(CameraModel).filter(CameraModel.zone_id == zone_id).update({"zone_id": None})
     db.delete(zone)
     db.commit()
     return {"status": "deleted", "zone_id": zone_id}
@@ -744,9 +700,6 @@ def get_incidents_map(
         {
             "id": z.id,
             "name": z.name,
-            "polygon": z.polygon,
-            "color": z.color,
-            "camera_id": z.camera_id,
         }
         for z in zones
     ]
@@ -891,6 +844,7 @@ def get_training_job(
 @app.post("/api/training-jobs/{job_id}/approve")
 def approve_training_job(
     job_id: int,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -924,11 +878,27 @@ def approve_training_job(
     job.current_stage = "approved"
     db.commit()
 
+    # If a rule was created while this class was still training, it was
+    # saved as "pending_training" rather than active or inactive. A rule
+    # can depend on more than one missing class, so it only goes live once
+    # every job pointing at it is approved — not just this one.
+    activated_rule = None
+    if job.rule_id:
+        pending_rule = db.query(Rule).filter(Rule.id == job.rule_id).first()
+        if pending_rule and pending_rule.status == "pending_training":
+            sibling_jobs = db.query(TrainingJob).filter(TrainingJob.rule_id == job.rule_id).all()
+            if all(j.status == "approved" for j in sibling_jobs):
+                pending_rule.status = "active"
+                db.commit()
+                background_tasks.add_task(_rebuild_and_restart_pipeline_bg, pending_rule.site_id)
+                activated_rule = {"id": pending_rule.id, "instruction": pending_rule.instruction}
+
     return {
         "status": "approved",
         "class_name": job.class_name,
         "registered_weights": job.model_path,
-        "message": f"'{job.class_name}' is now a live detection capability."
+        "message": f"'{job.class_name}' is now a live detection capability.",
+        "activated_rule": activated_rule,
     }
 
 
@@ -953,7 +923,20 @@ def reject_training_job(
     stages.append({"name": "rejected", "status": "done", "detail": f"Rejected by {current_user.name or current_user.email}"})
     job.stages = stages
     db.commit()
-    return {"status": "rejected", "class_name": job.class_name}
+
+    # A rejected job's dependent rule (if any) would otherwise be stuck in
+    # pending_training forever — invisible, with no path forward. Surface
+    # it as inactive instead, so it's at least visible and manageable, even
+    # though the specific reason it never went live isn't recorded anywhere.
+    orphaned_rule = None
+    if job.rule_id:
+        pending_rule = db.query(Rule).filter(Rule.id == job.rule_id).first()
+        if pending_rule and pending_rule.status == "pending_training":
+            pending_rule.status = "inactive"
+            db.commit()
+            orphaned_rule = {"id": pending_rule.id, "instruction": pending_rule.instruction}
+
+    return {"status": "rejected", "class_name": job.class_name, "orphaned_rule": orphaned_rule}
 
 @app.post("/api/pipeline/rebuild")
 def rebuild_pipeline_config(
@@ -1020,6 +1003,35 @@ def get_rules(
         .filter(Incident.site_id == current_user.site_id)
         .group_by(Incident.rule_id).all()
     )
+
+    rule_ids = [r.id for r in rules]
+    cameras_by_rule: dict = {}
+    if rule_ids:
+        zone_names = {z.id: z.name for z in db.query(Zone).filter(Zone.site_id == current_user.site_id).all()}
+        rows = (
+            db.query(RuleCamera, CameraModel)
+            .join(CameraModel, CameraModel.id == RuleCamera.camera_id)
+            .filter(RuleCamera.rule_id.in_(rule_ids))
+            .all()
+        )
+        for rc, cam in rows:
+            cameras_by_rule.setdefault(rc.rule_id, []).append({
+                "id": cam.id,
+                "name": cam.name,
+                "zone_id": cam.zone_id,
+                "zone_name": zone_names.get(cam.zone_id),
+            })
+
+    # A pending_training rule doesn't know which training job it's waiting
+    # on from its own row alone — TrainingJob.rule_id points the other way.
+    # Looked up here so the frontend can let clicking such a rule navigate
+    # straight to that job's detail page.
+    training_job_by_rule: dict = {}
+    if rule_ids:
+        from db.models import TrainingJob
+        for job in db.query(TrainingJob).filter(TrainingJob.rule_id.in_(rule_ids)).all():
+            training_job_by_rule.setdefault(job.rule_id, job.id)
+
     return [
         {
             "id": r.id,
@@ -1028,7 +1040,8 @@ def get_rules(
             "pipeline_id": r.pipeline_id,
             "status": r.status,
             "severity": r.severity,
-            "zone_id": r.zone_id,
+            "cameras": cameras_by_rule.get(r.id, []),
+            "training_job_id": training_job_by_rule.get(r.id),
             "created_at": r.created_at.isoformat() if r.created_at else None,
             "incident_count": counts.get(r.id, 0),
         }
@@ -1055,7 +1068,118 @@ def delete_rule(
     return {"status": "deleted", "rule_id": rule_id}
 
 
+def _rebuild_and_restart_pipeline_for_toggle(db: Session, site_id: int):
+    """
+    Shared by activate/deactivate below. Rewrites pipeline_config.json from
+    the DB's current active rules, then restarts the live run_pipeline.py
+    subprocess so the change actually takes effect immediately — mirroring
+    apply_rule's existing restart behavior, since the running pipeline only
+    reads its config at startup, not on a live-reload basis. Defaults to
+    camera_id=1 on restart, matching apply_rule's own existing default when
+    no specific camera is given.
+    """
+    global _pipeline_process
+    rebuilt = rebuild_pipeline_config_from_db(db, site_id)
+    config_path = Path("pipeline_config.json")
+    with open(config_path, "w") as f:
+        json.dump(rebuilt, f, indent=2)
+    if _pipeline_process is not None and _pipeline_process.poll() is None:
+        _pipeline_process.terminate()
+        try:
+            _pipeline_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _pipeline_process.kill()
+    _pipeline_process = subprocess.Popen(
+        [sys.executable, "run_pipeline.py", "--camera_id", "1"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+    )
+
+
+def _rebuild_and_restart_pipeline_bg(site_id: int):
+    """
+    Background-task version of the above — the request's own DB session
+    gets closed once the response is sent, and background tasks run *after*
+    that, so this opens a fresh session of its own (same pattern already
+    used by _reconnect_monitor) rather than reusing a session that may
+    already be gone by the time this actually executes.
+    """
+    db = SessionLocal()
+    try:
+        _rebuild_and_restart_pipeline_for_toggle(db, site_id)
+    finally:
+        db.close()
+
+
+@app.post("/api/rules/{rule_id}/activate")
+def activate_rule(
+    rule_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Viewers cannot activate rules")
+    rule = db.query(Rule).filter(
+        Rule.id == rule_id,
+        Rule.site_id == current_user.site_id
+    ).first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    if rule.status == "active":
+        return {"status": "already_active", "rule_id": rule_id}
+    if rule.status != "inactive":
+        raise HTTPException(status_code=400, detail=f"Cannot activate a rule with status '{rule.status}'")
+    missing = _missing_models_for_config(rule.config_json)
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Can't activate — still waiting on training for: {', '.join(missing)}. Check Self-Learning.",
+        )
+    rule.status = "active"
+    db.commit()
+    # Respond right away — restarting the live pipeline subprocess can take
+    # several seconds (terminate + model reload), which made the toggle feel
+    # broken while it silently blocked the response. That work now happens
+    # after the response is sent instead.
+    background_tasks.add_task(_rebuild_and_restart_pipeline_bg, current_user.site_id)
+    return {"status": "activated", "rule_id": rule_id}
+
+
+@app.post("/api/rules/{rule_id}/deactivate")
+def deactivate_rule(
+    rule_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Viewers cannot deactivate rules")
+    rule = db.query(Rule).filter(
+        Rule.id == rule_id,
+        Rule.site_id == current_user.site_id
+    ).first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    if rule.status == "inactive":
+        return {"status": "already_inactive", "rule_id": rule_id}
+    if rule.status != "active":
+        raise HTTPException(status_code=400, detail=f"Cannot deactivate a rule with status '{rule.status}'")
+    rule.status = "inactive"
+    db.commit()
+    background_tasks.add_task(_rebuild_and_restart_pipeline_bg, current_user.site_id)
+    return {"status": "deactivated", "rule_id": rule_id}
+
+
 SYSTEM_PROMPT = """You are ONVXP's rule generator. Convert plain English safety instructions into valid pipeline_config.json for a YOLO26 + ByteTrack computer vision pipeline.
+
+If the user instruction is NOT a request to monitor a camera for a specific safety/security condition — greetings ("hi"), small talk, questions ("what's the weather"), or anything with no real-world situation to detect and alert on — output exactly this and nothing else:
+{"not_a_rule": true}
+
+CRITICAL — do not confuse "not a rule" with "an object I don't recognize": if the instruction clearly describes something to detect and alert on, it IS a rule, even if the specific object mentioned (a red toolbox, a specific tool, an unusual item) isn't in AVAILABLE MODELS below. In that case, build the rule normally — see the instruction near the end of this prompt for how to handle an unrecognized object. Only use {"not_a_rule": true} when there is no detection/alerting intent in the instruction at all, never merely because a mentioned object is unfamiliar.
+
+Camera and zone selection is handled separately by the user through the app's own UI — never infer or invent a zone or camera name. Do not include a "zones" section in your output, and never include a "zone" field on any rule.
+
+Sensitivity (how long a violation must hold before alerting) and alert distance (for proximity rules) are also set by the user afterward through the UI — never include "persistence_frames" or "proximity_px" in your output.
 
 AVAILABLE MODELS:
 - "person"   - detects people on site (base YOLO26, COCO trained)
@@ -1066,15 +1190,14 @@ AVAILABLE MODELS:
 - "spill"    - detects liquid spills / hazardous liquids on floors (custom trained, mAP 88%)
 
 AVAILABLE RULE TYPES:
-- "person_in_zone"  - alert when any person enters zone
-- "missing_in_zone" - alert when person without required gear enters
-- "count_exceeded"  - alert when more than N people in zone. Set "count" to N, e.g. {"type": "count_exceeded", "zone": "warehouse", "count": 10}. Never omit "count" — if the instruction doesn't state a number, use a sensible default like 5.
-- "object_in_zone"  - alert when a specific OBJECT is detected inside the zone (no person needed). Use for instructions like "alert when fire/smoke/forklift/truck/ladder is detected". Set "target" to the model name, e.g. {"type": "object_in_zone", "zone": "site_area", "target": "fire", "required": []}
-- "person_near_object" - alert when a person comes close to a detected object. Use "target": "<model>" and "proximity_px": <number>. For "near acid/dangerous liquid/spill/chemical", use target "spill". Example: {"type": "person_near_object", "target": "spill", "proximity_px": 120}
+- "person_in_zone"  - alert when any person is detected
+- "missing_in_zone" - alert when a person without required gear is detected
+- "count_exceeded"  - alert when more than N people are detected. Set "count" to N, e.g. {"type": "count_exceeded", "count": 10}. Never omit "count" — if the instruction doesn't state a number, use a sensible default like 5.
+- "object_in_zone"  - alert when a specific OBJECT is detected (no person needed). Use for instructions like "alert when fire/smoke/forklift/truck/ladder is detected". Set "target" to the model name, e.g. {"type": "object_in_zone", "target": "fire", "required": []}
+- "person_near_object" - alert when a person comes close to a detected object. Use "target": "<model>". For "near acid/dangerous liquid/spill/chemical", use target "spill". Example: {"type": "person_near_object", "target": "spill"}
 
 IMPORTANT: "alert when X is detected" (fire, smoke, forklift, truck, ladder) means object_in_zone with target X — NOT person_in_zone. Every object_in_zone rule MUST include the "target" field, e.g. "target": "fire". Never omit it.
 IMPORTANT: "alert everyone near acid/spill/chemical/hazardous liquid" means person_near_object with target "spill" — NOT object_in_zone (this rule cares about people approaching the object, not just the object's presence). Never omit "target" on a person_near_object rule.
-For URGENT hazards (acid, fire, chemicals, danger, "immediately"), add "persistence_frames": 2 to the rule. Routine rules omit it.
 OUTPUT FORMAT (must match exactly):
 {
   "pipeline_id": "auto_<short_descriptive_name>",
@@ -1082,15 +1205,14 @@ OUTPUT FORMAT (must match exactly):
   "models": {
     "helmet": "runs/detect/helmet_model/weights/best.pt"
   },
-  "zones": [{"name": "<zone_name>", "coords": [[100,200],[500,200],[500,600],[100,600]]}],
-  "rules": [{"type": "<rule_type>", "zone": "<zone_name>", "required": ["<gear>"], "primary": "person", "target": "<object_model_if_object_or_proximity_rule>", "persistence_frames": 2, "proximity_px": 120, "count": 5}],
+  "rules": [{"type": "<rule_type>", "required": ["<gear>"], "primary": "person", "target": "<object_model_if_object_or_proximity_rule>", "count": 5}],
   "alert": {"severity": "high", "message": "<alert message>"},
   "cooldown_seconds": 30
 }
 
-NOTE on optional rule fields: include "persistence_frames" only for urgent hazards (value 2); include "proximity_px" only on person_near_object rules; include "target" only on object_in_zone and person_near_object rules; include "count" only on count_exceeded rules. Omit fields that don't apply.
+NOTE on optional rule fields: include "target" only on object_in_zone and person_near_object rules; include "count" only on count_exceeded rules. Omit fields that don't apply. Never include "zone", "persistence_frames", or "proximity_px" on a rule — those are added by the app afterward, not by you.
 If the instruction requires detecting an object class that is NOT in AVAILABLE MODELS (e.g. "trousers", "gloves", "ladder"), do NOT substitute a different model. Use the requested class name as the model key with weights path "runs/detect/<class>_model/weights/best.pt" and as the rule's target. The platform will train it.
-Only include models actually needed. Output ONLY the JSON. No markdown, no explanation."""
+Only include models actually needed. Remember: {"not_a_rule": true} is ONLY for input with no detection/alerting intent whatsoever (greetings, questions, chit-chat) — an unfamiliar object mentioned in an otherwise clear monitoring request is still a real rule, never reject it for that reason alone. Output ONLY the JSON. No markdown, no explanation."""
 
 
 @app.post("/api/rules/generate")
@@ -1103,22 +1225,29 @@ async def generate_rule(
     try:
         body = await request.json()
         instruction = body.get("instruction", "").strip()
-        existing_zones = body.get("existing_zones", [])
         if not instruction:
             raise HTTPException(status_code=400, detail="instruction is required")
-        camera_id = body.get("camera_id")
-        zone_names = []
-        if camera_id is not None:
-            try:
-                zone_names = [z.name for z in db.query(Zone).filter(Zone.camera_id == camera_id).all()]
-            except Exception:
-                zone_names = []
-        if not zone_names and existing_zones:
-            zone_names = [z["name"] for z in existing_zones if isinstance(z, dict) and "name" in z]
-        zone_context = ""
-        if zone_names:
-            zone_context = f"\n\nEXISTING ZONES: {', '.join(zone_names)}\nUse these zone names directly."
-        full_prompt = f"{SYSTEM_PROMPT}{zone_context}\n\nUser instruction: {instruction}\n\nJSON output:"
+
+        # ── Cheap, reliable pre-check for the most obvious non-rule inputs
+        # (greetings, filler) — independent of whether the LLM reliably
+        # follows the "not_a_rule" prompt instruction on every single call.
+        # Conservative on purpose: only exact matches against known filler,
+        # never a word-count threshold, so a genuinely short real rule
+        # (e.g. "alert on fire") is never mistakenly rejected here. ──
+        _NOT_A_RULE_PHRASES = {
+            "hi", "hello", "hey", "hiya", "yo",
+            "how are you", "what's up", "whats up", "sup",
+            "thanks", "thank you", "ok", "okay", "test", "testing",
+            "hi there", "hello there", "good morning", "good afternoon", "good evening",
+        }
+        _normalized = instruction.strip().lower().rstrip(".!?")
+        if _normalized in _NOT_A_RULE_PHRASES:
+            return {
+                "config": None, "instruction": instruction, "model_used": OLLAMA_MODEL,
+                "provider": "ollama_local", "unknown_classes": [], "training_jobs": [],
+            }
+
+        full_prompt = f"{SYSTEM_PROMPT}\n\nUser instruction: {instruction}\n\nJSON output:"
 
         ollama_payload = {"model": OLLAMA_MODEL, "prompt": full_prompt, "stream": False, "format": "json", "options": {"temperature": 0.1, "num_predict": 1024}}
 
@@ -1160,6 +1289,19 @@ async def generate_rule(
                 response_text = response_text[4:]
             response_text = response_text.strip()
         config = json.loads(response_text)
+
+        # ── The LLM itself decided this instruction isn't a rule at all
+        # (per the new SYSTEM_PROMPT directive), or ignored that instruction
+        # and returned syntactically valid but empty JSON anyway — either
+        # way, there's no usable rule here. Respect that rather than letting
+        # an empty object fall through the sanitizer below and get treated
+        # as a real, if oddly-shaped, rule. ──
+        if config.get("not_a_rule") or not config.get("rules"):
+            return {
+                "config": None, "instruction": instruction, "model_used": OLLAMA_MODEL,
+                "provider": "ollama_local", "unknown_classes": [], "training_jobs": [],
+            }
+
         model_keys = [m for m in config.get("models", {}).keys() if m != "person"]
         for r in config.get("rules", []):
             if r.get("type") in ("object_in_zone", "person_near_object") and not r.get("target"):
@@ -1175,13 +1317,7 @@ async def generate_rule(
                 print(f"[OMNIX] Sanitizer: filled missing count=5 on count_exceeded rule")
         with open('model_registry.json', 'r') as f:
             _registry = json.load(f)
-        _requested = set(config.get("models", {}).keys())
-        for r in config.get("rules", []):
-            if r.get("target"):
-                _requested.add(r["target"])
-            if r.get("type") == "missing_in_zone":
-                for item in r.get("required", []) or []:
-                    _requested.add(item)
+        _requested = _get_required_classes(config)
         unknown_classes = sorted(c for c in _requested if c not in _registry)
         training_jobs = []
         if unknown_classes:
@@ -1217,83 +1353,99 @@ async def generate_rule(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-def _normalize_zone_name(s: str) -> str:
-    return s.lower().replace("_", " ").replace("-", " ").strip()
+def _full_frame_zone_name(camera_id: int) -> str:
+    return f"camera_{camera_id}_full_frame"
 
 
-def enrich_zone_coords(config: dict, db: Session, site_id: int, camera_id: int = None) -> dict:
-    zones = config.get("zones", [])
-    if not zones:
-        return config
+def _full_frame_coords_for_camera(camera_id: int, db: Session) -> list:
+    """
+    No more user-drawn polygons — a rule now watches a whole camera's frame,
+    not a hand-drawn region within it. This just needs real dimensions for
+    that frame: prefer the actual live stream's resolution, then the
+    camera's last-known resolution, then a sensible fallback matching this
+    project's existing demo footage.
+    """
+    width, height = 854, 480
+    vs = video_streams.get(camera_id)
+    if vs and vs.width and vs.height:
+        width, height = vs.width, vs.height
+    else:
+        cam = db.query(CameraModel).filter(CameraModel.id == camera_id).first()
+        if cam and cam.resolution and "x" in cam.resolution:
+            try:
+                w, h = cam.resolution.split("x")
+                width, height = int(w), int(h)
+            except Exception:
+                pass
+    return [[0, 0], [width, 0], [width, height], [0, height]]
+
+
+def _get_required_classes(config: dict) -> set:
+    """
+    Every class name a pipeline config actually needs a trained model for —
+    model dict keys, any rule's "target", and any missing_in_zone rule's
+    "required" list. Single source of truth, used by generate_rule (to spot
+    unknown classes), rebuild_pipeline_config_from_db (to keep an unready
+    model out of the live pipeline), and activate_rule (to block reactivating
+    a rule whose model isn't there).
+    """
+    requested = set(config.get("models", {}).keys())
+    for r in config.get("rules", []):
+        if r.get("target"):
+            requested.add(r["target"])
+        if r.get("type") == "missing_in_zone":
+            for item in r.get("required", []) or []:
+                requested.add(item)
+    return requested
+
+
+def _missing_models_for_config(config: dict) -> list:
     try:
-        q = db.query(Zone).filter(Zone.site_id == site_id)
-        if camera_id is not None:
-            q = q.filter(Zone.camera_id == camera_id)
-        db_zone_rows = q.all()
-    except Exception as e:
-        print(f"[OMNIX] Zone enrichment skipped (DB error): {e}")
-        return config
-
-    if not db_zone_rows:
-        print(f"[OMNIX] WARNING: No user-drawn zones found for this camera — "
-              f"all rule zones will use LLM template coords (likely wrong area)")
-        return config
-
-    db_zones = {z.name: z.polygon for z in db_zone_rows}
-
-    for zone in zones:
-        name = zone.get("name", "")
-        polygon = None
-        match_reason = None
-
-        if name in db_zones:
-            polygon = db_zones[name]
-            match_reason = "exact match"
-
-        elif len(db_zone_rows) == 1:
-            only_zone = db_zone_rows[0]
-            polygon = only_zone.polygon
-            match_reason = f"only zone on this camera (LLM said '{name}', actual zone is '{only_zone.name}')"
-
-        else:
-            norm_target = _normalize_zone_name(name)
-            best_name = None
-            for db_name in db_zones:
-                norm_db_name = _normalize_zone_name(db_name)
-                if norm_target == norm_db_name or norm_target in norm_db_name or norm_db_name in norm_target:
-                    best_name = db_name
-                    break
-            if not best_name:
-                norm_to_original = {_normalize_zone_name(n): n for n in db_zones}
-                close = difflib.get_close_matches(norm_target, list(norm_to_original.keys()), n=1, cutoff=0.6)
-                if close:
-                    best_name = norm_to_original[close[0]]
-            if best_name:
-                polygon = db_zones[best_name]
-                match_reason = f"fuzzy match (LLM said '{name}', matched to '{best_name}')"
-
-        if polygon and len(polygon) >= 3:
-            zone["coords"] = polygon
-            zone["source"] = "user_drawn"
-            print(f"[OMNIX] Zone '{name}': using user-drawn polygon ({len(polygon)} points) — {match_reason}")
-        else:
-            print(f"[OMNIX] WARNING: Zone '{name}' has no matching user-drawn polygon "
-                  f"(available zones: {list(db_zones.keys())}) — falling back to LLM "
-                  f"template coords. This rule may be watching the WRONG AREA!")
-
-    return config
+        with open("model_registry.json", "r") as f:
+            registry = json.load(f)
+    except Exception:
+        registry = {}
+    required = _get_required_classes(config)
+    return sorted(c for c in required if c not in registry)
 
 
-def rebuild_pipeline_config_from_db(db: Session, site_id: int) -> dict:
-    active_rules = db.query(Rule).filter(
-        Rule.site_id == site_id,
-        Rule.status == "active",
-    ).order_by(Rule.created_at.asc()).all()
+def rebuild_pipeline_config_from_db(db: Session, site_id: int, camera_id: int = 1) -> dict:
+    """
+    Rebuilds pipeline_config.json from the currently-active Rule rows that
+    are attached (via RuleCamera) to `camera_id`. The live pipeline only
+    ever runs one camera's feed at a time today — camera_id defaults to 1,
+    matching what's actually running — so only rules attached to that
+    specific camera are included here. A rule can be attached to several
+    cameras at once (e.g. Camera 1 in one building and Camera 4 in
+    another), but each camera's own live pipeline only pulls in the rules
+    relevant to itself.
+
+    True simultaneous multi-camera enforcement — running several cameras'
+    pipelines at once, each picking up the rules attached to it — is a
+    separate piece of infrastructure not built yet; this only prepares the
+    correct config for whichever single camera is currently running.
+
+    Each included rule gets a zone auto-generated as that camera's full
+    frame — there's no user-drawn polygon anymore, since zones are just
+    named buildings/places now, not regions within a frame.
+    """
+    active_rules = (
+        db.query(Rule)
+        .join(RuleCamera, RuleCamera.rule_id == Rule.id)
+        .filter(
+            Rule.site_id == site_id,
+            Rule.status == "active",
+            RuleCamera.camera_id == camera_id,
+        )
+        .order_by(Rule.created_at.asc())
+        .distinct()
+        .all()
+    )
 
     if not active_rules:
         return {
             "pipeline_id": "auto_empty",
-            "description": "No active rules",
+            "description": "No active rules for this camera",
             "models": {},
             "zones": [],
             "rules": [],
@@ -1301,17 +1453,44 @@ def rebuild_pipeline_config_from_db(db: Session, site_id: int) -> dict:
             "cooldown_seconds": 30,
         }
 
+    # A rule can be "active" in the DB the moment it's created (self-learning
+    # may still be training its model) without that unready reference ever
+    # reaching the live detector — including it here would crash the one
+    # shared pipeline process for every rule, not just this one.
+    runnable_rules = []
+    for r in active_rules:
+        missing = _missing_models_for_config(r.config_json)
+        if missing:
+            print(f"[OMNIX] Rule {r.id} is active but not yet runnable — waiting on model(s): {', '.join(missing)}")
+        else:
+            runnable_rules.append(r)
+
+    if not runnable_rules:
+        return {
+            "pipeline_id": "auto_empty",
+            "description": "Active rules exist for this camera, but none have a ready model yet",
+            "models": {},
+            "zones": [],
+            "rules": [],
+            "alert": {"severity": "medium", "message": "No active rules"},
+            "cooldown_seconds": 30,
+        }
+
+    zone_name = _full_frame_zone_name(camera_id)
+    zone_coords = _full_frame_coords_for_camera(camera_id, db)
+
     def stamp(cfg: dict, rule_db_id: int) -> dict:
         cfg = json.loads(json.dumps(cfg))
+        cfg["zones"] = [{"name": zone_name, "coords": zone_coords}]
         for r in cfg.get("rules", []):
             r["rule_db_id"] = rule_db_id
+            r["zone"] = zone_name
         return cfg
 
-    merged = stamp(active_rules[0].config_json, active_rules[0].id)
-    for db_rule in active_rules[1:]:
+    merged = stamp(runnable_rules[0].config_json, runnable_rules[0].id)
+    for db_rule in runnable_rules[1:]:
         stamped_cfg = stamp(db_rule.config_json, db_rule.id)
         merged = merge_configs(merged, stamped_cfg)
-    merged = enrich_zone_coords(merged, db, site_id)
 
     site_settings = get_settings_for_site(db, site_id)
     merged["persistence_frames"] = site_settings["detection"].get("persistence_frames", 5)
@@ -1355,20 +1534,30 @@ def merge_configs(existing: dict, new_cfg: dict) -> dict:
 @app.post("/api/rules/apply")
 async def apply_rule(
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    global _pipeline_process
     try:
         body = await request.json()
         new_config = body.get("config")
         instruction = body.get("instruction", "")
-        force_overwrite = body.get("overwrite", False)
-        camera_id = int(body.get("camera_id") or 1)
+        camera_ids = body.get("camera_ids") or []
         if not new_config:
             raise HTTPException(status_code=400, detail="config is required")
+        if not camera_ids:
+            raise HTTPException(status_code=400, detail="Select at least one camera")
         if current_user.role != "admin":
             raise HTTPException(status_code=403, detail="Viewers cannot apply rules")
+
+        cameras = db.query(CameraModel).filter(
+            CameraModel.id.in_(camera_ids),
+            CameraModel.site_id == current_user.site_id,
+        ).all()
+        if len(cameras) != len(set(camera_ids)):
+            raise HTTPException(status_code=400, detail="One or more selected cameras were not found")
+
+        missing = _missing_models_for_config(new_config)
         try:
             dupes = db.query(Rule).filter(
                 Rule.site_id == current_user.site_id,
@@ -1382,7 +1571,8 @@ async def apply_rule(
             rule = Rule(
                 site_id=current_user.site_id, user_id=current_user.id,
                 instruction=instruction, config_json=new_config,
-                pipeline_id=new_config.get("pipeline_id"), status="active",
+                pipeline_id=new_config.get("pipeline_id"),
+                status="pending_training" if missing else "active",
                 severity=new_config.get("alert", {}).get("severity", "medium"),
             )
             db.add(rule)
@@ -1390,76 +1580,89 @@ async def apply_rule(
             db.refresh(rule)
             for r in new_config.get("rules", []):
                 r["rule_db_id"] = rule.id
+            for cam in cameras:
+                db.add(RuleCamera(rule_id=rule.id, camera_id=cam.id))
+            db.commit()
+            training_jobs = []
+            if missing:
+                # Link every training job this rule is waiting on, so its
+                # approval can find its way back here later (this is what
+                # TrainingJob.rule_id was already meant for).
+                from db.models import TrainingJob
+                jobs = db.query(TrainingJob).filter(
+                    TrainingJob.site_id == current_user.site_id,
+                    TrainingJob.class_name.in_(missing),
+                    TrainingJob.status.notin_(["failed", "cancelled"]),
+                ).all()
+                for job in jobs:
+                    job.rule_id = rule.id
+                db.commit()
+                training_jobs = [
+                    {"id": j.id, "class_name": j.class_name, "status": j.status, "reused": True}
+                    for j in jobs
+                ]
+        except HTTPException:
+            raise
         except Exception as e:
-            print(f"[OMNIX] Warning: could not save rule to DB: {e}")
-        config_path = Path("pipeline_config.json")
-        if config_path.exists():
-            backup_path = Path("pipeline_config.backup.json")
-            with open(config_path, "r") as src, open(backup_path, "w") as dst:
-                dst.write(src.read())
-        if config_path.exists() and not force_overwrite:
-            with open(config_path, "r") as f:
-                existing_config = json.load(f)
-            merged = merge_configs(existing_config, new_config)
-        else:
-            merged = new_config
-        merged = enrich_zone_coords(merged, db, current_user.site_id, camera_id)
+            # If the rule can't actually be saved, stop here — don't touch
+            # live detection for a rule that was never persisted. Without
+            # this, a save failure could leave a rule silently running with
+            # no DB row at all, invisible and unmanageable from the Rules
+            # page.
+            db.rollback()
+            print(f"[OMNIX] ERROR: could not save rule to DB: {e}")
+            raise HTTPException(status_code=500, detail=f"Could not save the rule: {e}")
 
-        site_settings = get_settings_for_site(db, current_user.site_id)
-        merged["persistence_frames"] = site_settings["detection"].get("persistence_frames", 5)
-        merged["alert_cooldown_frames"] = site_settings["detection"].get("alert_cooldown_frames", 150)
-        merged["detection_confidence"] = site_settings["detection"].get("detection_confidence", 0.5)
-        merged["email_notifications_enabled"] = site_settings["alerts"].get("email_notifications_enabled", False)
-        merged["email_severity_threshold"] = site_settings["alerts"].get("email_severity_threshold", "high")
+        if missing:
+            # Nothing to run yet, and nothing shown as active OR inactive —
+            # this rule only appears in the Rules list once every model it
+            # needs is actually approved (see approve_training_job below).
+            return {
+                "status": "pending_training",
+                "rule_id": rule.id,
+                "missing_models": missing,
+                "training_jobs": training_jobs,
+                "message": f"Saved — waiting on training for: {', '.join(missing)}. Check Self-Learning for progress.",
+            }
 
-        with open(config_path, "w") as f:
-            json.dump(merged, f, indent=2)
-        if _pipeline_process is not None and _pipeline_process.poll() is None:
-            _pipeline_process.terminate()
-            try:
-                _pipeline_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                _pipeline_process.kill()
-        incidents_file = Path("incidents.json")
-        if incidents_file.exists():
-            incidents_file.unlink()
-        _pipeline_process = subprocess.Popen(
-            [sys.executable, "run_pipeline.py", "--camera_id", str(camera_id)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-        )
+        # Respond immediately; the actual config rebuild + pipeline restart
+        # happens in the background, same pattern as activate/deactivate —
+        # restarting the detector can take several seconds and shouldn't
+        # block this response. Live detection today only ever runs one
+        # camera's pipeline at a time (camera 1 by default) — if this rule
+        # applies to that camera, this picks it up; true simultaneous
+        # multi-camera enforcement is a separate piece of infrastructure
+        # not built yet.
+        background_tasks.add_task(_rebuild_and_restart_pipeline_bg, current_user.site_id)
+
         return {
             "status": "applied",
-            "message": f"Rule merged and pipeline started. {len(merged['rules'])} rule(s) now active.",
-            "config_path": str(config_path),
-            "pipeline_id": merged["pipeline_id"],
-            "total_zones": len(merged["zones"]),
-            "total_rules": len(merged["rules"]),
-            "pipeline_pid": _pipeline_process.pid,
-            "camera_id": camera_id,
+            "message": f"Rule saved for {len(cameras)} camera(s): {', '.join(c.name for c in cameras)}.",
+            "rule_id": rule.id,
+            "pipeline_id": new_config.get("pipeline_id"),
+            "camera_ids": [c.id for c in cameras],
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/rules/reset")
 def reset_rules(
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Viewers cannot reset rules")
+        raise HTTPException(status_code=403, detail="Viewers cannot disable all rules")
     deactivated = db.query(Rule).filter(
         Rule.site_id == current_user.site_id,
         Rule.status == "active",
     ).update({"status": "inactive"})
     db.commit()
-    config_path = Path("pipeline_config.json")
-    backup_path = Path("pipeline_config.backup.json")
-    if config_path.exists():
-        if backup_path.exists():
-            backup_path.unlink()
-        config_path.rename(backup_path)
-    return {"status": "reset", "message": f"Pipeline config cleared, {deactivated} rule(s) deactivated."}
+    background_tasks.add_task(_rebuild_and_restart_pipeline_bg, current_user.site_id)
+    return {"status": "reset", "message": f"{deactivated} rule(s) deactivated."}
 
 
 @app.get("/api/pipeline/status")
@@ -1576,12 +1779,14 @@ class CameraCreateRequest(BaseModel):
     name: str
     location: str = ""
     source: str
+    zone_id: int | None = None
 
 
 class CameraUpdateRequest(BaseModel):
     name: str | None = None
     location: str | None = None
     source: str | None = None
+    zone_id: int | None = None
 
 
 def _validate_source(source: str) -> str:
@@ -1606,6 +1811,11 @@ def get_cameras(
         CameraModel.site_id == current_user.site_id
     ).order_by(CameraModel.id).all()
 
+    zone_names = {
+        z.id: z.name
+        for z in db.query(Zone).filter(Zone.site_id == current_user.site_id).all()
+    }
+
     result = []
     for cam in cameras:
         vs = video_streams.get(cam.id)
@@ -1620,6 +1830,8 @@ def get_cameras(
             "fps":        int(vs.fps) if is_live else 0,
             "resolution": f"{vs.width}x{vs.height}" if is_live else "N/A",
             "source": vs.source if is_live else cam.source,
+            "zone_id": cam.zone_id,
+            "zone_name": zone_names.get(cam.zone_id),
         })
     return result
 
@@ -1635,6 +1847,7 @@ def create_camera(
     validated_source = _validate_source(body.source)
     cam = CameraModel(
         site_id=current_user.site_id,
+        zone_id=body.zone_id,
         name=(body.name or "").strip() or "Unnamed Camera",
         location=(body.location or "").strip(),
         source=validated_source,
@@ -1656,6 +1869,7 @@ def create_camera(
         "id": cam.id, "name": cam.name, "location": cam.location,
         "source": cam.source, "status": cam.status,
         "fps": cam.fps, "resolution": cam.resolution,
+        "zone_id": cam.zone_id,
     }
 
 
@@ -1679,6 +1893,8 @@ def update_camera(
         cam.name = body.name.strip()
     if body.location is not None:
         cam.location = body.location.strip()
+    if body.zone_id is not None:
+        cam.zone_id = body.zone_id
 
     source_changed = False
     if body.source is not None:
